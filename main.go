@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -18,9 +17,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	ui "github.com/gizak/termui/v3"
+	"github.com/gizak/termui/v3/widgets"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -216,6 +218,309 @@ func computeWear(designCap, fullCap int) float64 {
 	return float64(designCap-fullCap) / float64(designCap) * 100.0
 }
 
+// isOnBattery проверяет, работает ли система от батареи
+func isOnBattery() (bool, string, int, error) {
+	pct, state, err := parsePMSet()
+	if err != nil {
+		return false, "", 0, err
+	}
+
+	isOnBatt := strings.ToLower(state) == "discharging" ||
+		strings.ToLower(state) == "finishing" ||
+		strings.ToLower(state) == "charged"
+
+	return isOnBatt, state, pct, nil
+}
+
+// backgroundDataCollection запускает сбор данных в фоне
+func backgroundDataCollection(db *sqlx.DB, ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Делаем первое измерение
+	meas, err := getMeasurement()
+	if err != nil {
+		log.Printf("первичное измерение: %v", err)
+		return
+	}
+
+	if err = insertMeasurement(db, meas); err != nil {
+		log.Printf("запись первой записи: %v", err)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m, err := getMeasurement()
+			if err != nil {
+				log.Printf("измерение: %v", err)
+				continue
+			}
+			if err = insertMeasurement(db, m); err != nil {
+				log.Printf("запись измерения: %v", err)
+			}
+
+			// Если подключили зарядку или батарея села, можно остановить сбор
+			// Но для дашборда продолжаем работать
+			if strings.ToLower(m.State) == "charging" && m.Percentage >= 100 {
+				log.Println("Батарея полностью заряжена, замедляем сбор данных")
+				// Увеличиваем интервал при полной зарядке
+				ticker.Reset(5 * time.Minute)
+			} else if strings.ToLower(m.State) == "discharging" {
+				// Возвращаем нормальный интервал при разрядке
+				ticker.Reset(interval)
+			}
+		}
+	}
+}
+
+// showDashboard отображает интерактивный дашборд в терминале
+func showDashboard(db *sqlx.DB, ctx context.Context) error {
+	if err := ui.Init(); err != nil {
+		return fmt.Errorf("инициализация UI: %w", err)
+	}
+	defer ui.Close()
+
+	// Получаем данные за последние 50 измерений
+	measurements, err := getLastNMeasurements(db, 50)
+	if err != nil {
+		return fmt.Errorf("получение данных: %w", err)
+	}
+
+	if len(measurements) == 0 {
+		// Если данных нет, показываем заглушку и ждем первых данных
+		placeholder := widgets.NewParagraph()
+		placeholder.Title = "Сбор данных"
+		placeholder.Text = "Ожидание первых измерений батареи...\nДанные появятся через несколько секунд.\n\nНажмите 'q' для выхода"
+		placeholder.SetRect(0, 0, 80, 10)
+
+		ui.Render(placeholder)
+
+		// Ждем появления данных или выхода
+		uiEvents := ui.PollEvents()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case e := <-uiEvents:
+				if e.ID == "q" || e.ID == "<C-c>" {
+					return nil
+				}
+			case <-ticker.C:
+				measurements, err = getLastNMeasurements(db, 50)
+				if err == nil && len(measurements) > 0 {
+					goto renderDashboard
+				}
+			}
+		}
+	}
+
+renderDashboard:
+
+	// График заряда батареи
+	batteryChart := widgets.NewPlot()
+	batteryChart.Title = "Заряд батареи (%)"
+	batteryChart.Data = make([][]float64, 1)
+	batteryChart.Data[0] = make([]float64, len(measurements))
+	for i, m := range measurements {
+		batteryChart.Data[0][i] = float64(m.Percentage)
+	}
+	batteryChart.SetRect(0, 0, 60, 15)
+	batteryChart.AxesColor = ui.ColorWhite
+	batteryChart.LineColors[0] = ui.ColorGreen
+
+	// График емкости
+	capacityChart := widgets.NewPlot()
+	capacityChart.Title = "Текущая емкость (мАч)"
+	capacityChart.Data = make([][]float64, 1)
+	capacityChart.Data[0] = make([]float64, len(measurements))
+	for i, m := range measurements {
+		capacityChart.Data[0][i] = float64(m.CurrentCapacity)
+	}
+	capacityChart.SetRect(60, 0, 120, 15)
+	capacityChart.AxesColor = ui.ColorWhite
+	capacityChart.LineColors[0] = ui.ColorBlue
+
+	// Текущая информация
+	latest := measurements[len(measurements)-1]
+	wear := computeWear(latest.DesignCapacity, latest.FullChargeCap)
+	avgRate := computeAvgRate(measurements, 5)
+	remaining := computeRemainingTime(latest.CurrentCapacity, avgRate)
+
+	infoList := widgets.NewList()
+	infoList.Title = "Текущее состояние"
+	infoList.Rows = []string{
+		fmt.Sprintf("Заряд: %d%%", latest.Percentage),
+		fmt.Sprintf("Состояние: %s", strings.Title(latest.State)),
+		fmt.Sprintf("Циклы: %d", latest.CycleCount),
+		fmt.Sprintf("Износ: %.1f%%", wear),
+		fmt.Sprintf("Скорость разрядки: %.2f мАч/ч", avgRate),
+		fmt.Sprintf("Осталось времени: %s", remaining.Truncate(time.Minute)),
+		"",
+		"Нажмите 'q' для выхода",
+		"Нажмите 'r' для обновления",
+	}
+	infoList.SetRect(0, 15, 60, 25)
+
+	// Гистограмма состояний
+	stateGauge := widgets.NewGauge()
+	stateGauge.Title = "Заряд батареи"
+	stateGauge.Percent = latest.Percentage
+	stateGauge.SetRect(60, 15, 120, 18)
+	stateGauge.BarColor = ui.ColorGreen
+	if latest.Percentage < 20 {
+		stateGauge.BarColor = ui.ColorRed
+	} else if latest.Percentage < 50 {
+		stateGauge.BarColor = ui.ColorYellow
+	}
+
+	// Износ батареи
+	wearGauge := widgets.NewGauge()
+	wearGauge.Title = "Износ батареи"
+	wearGauge.Percent = int(wear)
+	wearGauge.SetRect(60, 18, 120, 21)
+	wearGauge.BarColor = ui.ColorRed
+
+	// Таблица последних измерений
+	table := widgets.NewTable()
+	table.Title = "Последние измерения"
+	table.Rows = [][]string{
+		{"Время", "Заряд", "Состояние", "Емкость"},
+	}
+	for i := len(measurements) - 5; i < len(measurements) && i >= 0; i++ {
+		if i < 0 {
+			continue
+		}
+		m := measurements[i]
+		timeStr := m.Timestamp[11:19] // только время
+		table.Rows = append(table.Rows, []string{
+			timeStr,
+			fmt.Sprintf("%d%%", m.Percentage),
+			m.State,
+			fmt.Sprintf("%d мАч", m.CurrentCapacity),
+		})
+	}
+	table.SetRect(60, 21, 120, 25)
+
+	render := func() {
+		ui.Render(batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
+	}
+
+	render()
+
+	uiEvents := ui.PollEvents()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case e := <-uiEvents:
+			switch e.ID {
+			case "q", "<C-c>":
+				return nil
+			case "r":
+				// Обновляем данные
+				newMeasurements, err := getLastNMeasurements(db, 50)
+				if err == nil && len(newMeasurements) > 0 {
+					measurements = newMeasurements
+					latest = measurements[len(measurements)-1]
+
+					// Обновляем графики
+					batteryChart.Data[0] = make([]float64, len(measurements))
+					capacityChart.Data[0] = make([]float64, len(measurements))
+					for i, m := range measurements {
+						batteryChart.Data[0][i] = float64(m.Percentage)
+						capacityChart.Data[0][i] = float64(m.CurrentCapacity)
+					}
+
+					// Пересчитываем статистику
+					wear = computeWear(latest.DesignCapacity, latest.FullChargeCap)
+					avgRate = computeAvgRate(measurements, 5)
+					remaining = computeRemainingTime(latest.CurrentCapacity, avgRate)
+
+					// Обновляем виджеты
+					stateGauge.Percent = latest.Percentage
+					wearGauge.Percent = int(wear)
+
+					infoList.Rows[0] = fmt.Sprintf("Заряд: %d%%", latest.Percentage)
+					infoList.Rows[1] = fmt.Sprintf("Состояние: %s", strings.Title(latest.State))
+					infoList.Rows[2] = fmt.Sprintf("Циклы: %d", latest.CycleCount)
+					infoList.Rows[3] = fmt.Sprintf("Износ: %.1f%%", wear)
+					infoList.Rows[4] = fmt.Sprintf("Скорость разрядки: %.2f мАч/ч", avgRate)
+					infoList.Rows[5] = fmt.Sprintf("Осталось времени: %s", remaining.Truncate(time.Minute))
+
+					render()
+				}
+			}
+		case <-ticker.C:
+			// Автоматическое обновление каждые 10 секунд
+			newMeasurements, err := getLastNMeasurements(db, 50)
+			if err == nil && len(newMeasurements) > 0 {
+				measurements = newMeasurements
+				latest = measurements[len(measurements)-1]
+				wear = computeWear(latest.DesignCapacity, latest.FullChargeCap)
+				avgRate = computeAvgRate(measurements, 5)
+				remaining = computeRemainingTime(latest.CurrentCapacity, avgRate)
+
+				// Обновляем все виджеты
+				batteryChart.Data[0] = make([]float64, len(measurements))
+				capacityChart.Data[0] = make([]float64, len(measurements))
+				for i, m := range measurements {
+					batteryChart.Data[0][i] = float64(m.Percentage)
+					capacityChart.Data[0][i] = float64(m.CurrentCapacity)
+				}
+
+				stateGauge.Percent = latest.Percentage
+				if latest.Percentage < 20 {
+					stateGauge.BarColor = ui.ColorRed
+				} else if latest.Percentage < 50 {
+					stateGauge.BarColor = ui.ColorYellow
+				} else {
+					stateGauge.BarColor = ui.ColorGreen
+				}
+
+				wearGauge.Percent = int(wear)
+
+				infoList.Rows[0] = fmt.Sprintf("Заряд: %d%%", latest.Percentage)
+				infoList.Rows[1] = fmt.Sprintf("Состояние: %s", strings.Title(latest.State))
+				infoList.Rows[2] = fmt.Sprintf("Циклы: %d", latest.CycleCount)
+				infoList.Rows[3] = fmt.Sprintf("Износ: %.1f%%", wear)
+				infoList.Rows[4] = fmt.Sprintf("Скорость разрядки: %.2f мАч/ч", avgRate)
+				infoList.Rows[5] = fmt.Sprintf("Осталось времени: %s", remaining.Truncate(time.Minute))
+
+				// Обновляем таблицу последних измерений
+				table.Rows = [][]string{
+					{"Время", "Заряд", "Состояние", "Емкость"},
+				}
+				for i := len(measurements) - 5; i < len(measurements) && i >= 0; i++ {
+					if i < 0 {
+						continue
+					}
+					m := measurements[i]
+					timeStr := m.Timestamp[11:19]
+					table.Rows = append(table.Rows, []string{
+						timeStr,
+						fmt.Sprintf("%d%%", m.Percentage),
+						m.State,
+						fmt.Sprintf("%d мАч", m.CurrentCapacity),
+					})
+				}
+
+				render()
+			}
+		}
+	}
+}
+
 // printReport выводит отчёт о последнем измерении и статистике.
 func printReport(db *sqlx.DB) error {
 	ms, err := getLastNMeasurements(db, 10)
@@ -303,10 +608,7 @@ func watchLoop(db *sqlx.DB, ctx context.Context) {
 
 // main – точка входа программы.
 func main() {
-	var watchMode bool
-	flag.BoolVar(&watchMode, "watch", false, "режим непрерывного сбора данных")
-	flag.Parse()
-
+	// Убираем флаги - программа работает автоматически
 	db, err := initDB(dbFile)
 	if err != nil {
 		log.Fatalf("инициализация БД: %v", err)
@@ -324,9 +626,43 @@ func main() {
 		cancel()
 	}()
 
-	if watchMode {
-		watchLoop(db, ctx)
+	// Проверяем текущее состояние питания
+	onBattery, state, percentage, err := isOnBattery()
+	if err != nil {
+		log.Printf("Ошибка определения состояния питания: %v", err)
+		// Продолжаем работу, показываем что есть в базе
+		if err := printReport(db); err != nil {
+			log.Fatalf("вывод отчёта: %v", err)
+		}
+		return
+	}
+
+	fmt.Printf("Состояние питания: %s (%d%%)\n", strings.Title(state), percentage)
+
+	if onBattery {
+		fmt.Println("Компьютер работает от батареи - запускаю мониторинг и дашборд...")
+
+		// Запускаем сбор данных в фоне
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go backgroundDataCollection(db, ctx, &wg)
+
+		// Небольшая задержка для первого измерения
+		time.Sleep(2 * time.Second)
+
+		// Показываем дашборд
+		if err := showDashboard(db, ctx); err != nil {
+			log.Printf("дашборд: %v", err)
+		}
+
+		// Ждем завершения фонового процесса
+		cancel()
+		wg.Wait()
+
 	} else {
+		fmt.Println("Компьютер работает от сети - показываю сохраненные данные...")
+
+		// Просто показываем отчет по имеющимся данным
 		if err := printReport(db); err != nil {
 			log.Fatalf("вывод отчёта: %v", err)
 		}
