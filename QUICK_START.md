@@ -18,7 +18,17 @@ macOS может обманывать:
 - Наберите "Terminal"
 - Нажмите Enter
 
-### 2️⃣ Скопируйте и вставьте эту команду
+### 2️⃣ ПРОСТОЙ СПОСОБ (рекомендуется)
+
+**Скачать готовое приложение:**
+
+1. Идите на [GitHub Releases](https://github.com/region23/batmon/releases/latest)
+2. Скачайте `BatMon.zip`
+3. Распакуйте и запустите `BatMon.app`
+
+### 2️⃣ ДЛЯ ПРОГРАММИСТОВ
+
+**Сборка из кода:**
 
 ```bash
 git clone https://github.com/region23/batmon.git && cd batmon && go build -o batmon && ./batmon
