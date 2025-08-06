@@ -772,6 +772,14 @@ func min(a, b int) int {
 	return b
 }
 
+// max возвращает максимальное значение
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // analyzeCapacityTrend анализирует тренд деградации батареи
 func analyzeCapacityTrend(measurements []Measurement) TrendAnalysis {
 	if len(measurements) < 10 {
@@ -1867,7 +1875,50 @@ type DashboardLayout struct {
 func calculateLayout() DashboardLayout {
 	termWidth, termHeight := ui.TerminalDimensions()
 
-	// Минимальные размеры
+	var layout DashboardLayout
+
+	// Для очень маленьких терминалов - упрощенный лейаут
+	if termWidth < 60 || termHeight < 20 {
+		// Минимальные размеры для упрощенного лейаута
+		if termWidth < 40 {
+			termWidth = 40
+		}
+		if termHeight < 15 {
+			termHeight = 15
+		}
+
+		// Упрощенный лейаут: только основные элементы
+		halfHeight := termHeight / 2
+
+		layout.BatteryChart.X1 = 0
+		layout.BatteryChart.Y1 = 0
+		layout.BatteryChart.X2 = termWidth
+		layout.BatteryChart.Y2 = halfHeight
+
+		layout.InfoList.X1 = 0
+		layout.InfoList.Y1 = halfHeight
+		layout.InfoList.X2 = termWidth
+		layout.InfoList.Y2 = termHeight
+
+		// Остальные виджеты скрываем (нулевые размеры)
+		layout.CapacityChart = layout.BatteryChart // Дублируем чтобы не было ошибок
+		layout.StateGauge.X1 = 0
+		layout.StateGauge.Y1 = 0
+		layout.StateGauge.X2 = 0
+		layout.StateGauge.Y2 = 0
+		layout.WearGauge.X1 = 0
+		layout.WearGauge.Y1 = 0
+		layout.WearGauge.X2 = 0
+		layout.WearGauge.Y2 = 0
+		layout.Table.X1 = 0
+		layout.Table.Y1 = 0
+		layout.Table.X2 = 0
+		layout.Table.Y2 = 0
+
+		return layout
+	}
+
+	// Стандартные минимальные размеры
 	if termWidth < 80 {
 		termWidth = 80
 	}
@@ -1875,12 +1926,16 @@ func calculateLayout() DashboardLayout {
 		termHeight = 25
 	}
 
-	var layout DashboardLayout
-
 	// Рассчитываем размеры относительно терминала
 	leftWidth := termWidth / 2
 	topHeight := (termHeight * 3) / 5 // 60% высоты для графиков
 	bottomHeight := termHeight - topHeight
+
+	// Убеждаемся, что нижняя область имеет минимальную высоту
+	if bottomHeight < 6 {
+		topHeight = termHeight - 6
+		bottomHeight = 6
+	}
 
 	// График заряда батареи (левый верхний)
 	layout.BatteryChart.X1 = 0
@@ -1888,36 +1943,41 @@ func calculateLayout() DashboardLayout {
 	layout.BatteryChart.X2 = leftWidth
 	layout.BatteryChart.Y2 = topHeight
 
-	// График ёмкости (правый верхний)
-	layout.CapacityChart.X1 = leftWidth
+	// График ёмкости (правый верхний) - добавляем отступ от левой колонки
+	layout.CapacityChart.X1 = leftWidth + 1
 	layout.CapacityChart.Y1 = 0
 	layout.CapacityChart.X2 = termWidth
 	layout.CapacityChart.Y2 = topHeight
 
-	// Информационный список (левый нижний)
+	// Информационный список (левый нижний) - уменьшаем правую границу на 1 символ
 	layout.InfoList.X1 = 0
 	layout.InfoList.Y1 = topHeight
-	layout.InfoList.X2 = leftWidth
+	layout.InfoList.X2 = leftWidth - 1
 	layout.InfoList.Y2 = termHeight
 
-	// Правая нижняя область разделена на части
-	rightBottomHeight := bottomHeight / 3
+	// Правая нижняя область: лучше разделить с минимальными размерами
+	gaugeHeight := max(4, bottomHeight/3) // Минимум 4 строки для каждого gauge
 
-	// Гистограмма заряда
-	layout.StateGauge.X1 = leftWidth
+	// Убеждаемся, что все виджеты помещаются
+	if gaugeHeight*2+6 > bottomHeight { // 6 = минимум для таблицы
+		gaugeHeight = max(4, (bottomHeight-6)/3) // Сжимаем gauges если не помещается, но не меньше 4
+	}
+
+	// Гистограмма заряда - добавляем отступ от левой колонки
+	layout.StateGauge.X1 = leftWidth + 1
 	layout.StateGauge.Y1 = topHeight
 	layout.StateGauge.X2 = termWidth
-	layout.StateGauge.Y2 = topHeight + rightBottomHeight
+	layout.StateGauge.Y2 = topHeight + gaugeHeight
 
-	// Гистограмма износа
-	layout.WearGauge.X1 = leftWidth
-	layout.WearGauge.Y1 = topHeight + rightBottomHeight
+	// Гистограмма износа - добавляем отступ от левой колонки
+	layout.WearGauge.X1 = leftWidth + 1
+	layout.WearGauge.Y1 = topHeight + gaugeHeight
 	layout.WearGauge.X2 = termWidth
-	layout.WearGauge.Y2 = topHeight + 2*rightBottomHeight
+	layout.WearGauge.Y2 = topHeight + 2*gaugeHeight
 
-	// Таблица последних измерений
-	layout.Table.X1 = leftWidth
-	layout.Table.Y1 = topHeight + 2*rightBottomHeight
+	// Таблица последних измерений - добавляем отступ от левой колонки
+	layout.Table.X1 = leftWidth + 1
+	layout.Table.Y1 = topHeight + 2*gaugeHeight
 	layout.Table.X2 = termWidth
 	layout.Table.Y2 = termHeight
 
@@ -1928,18 +1988,29 @@ func calculateLayout() DashboardLayout {
 func applyLayout(layout DashboardLayout, batteryChart, capacityChart *widgets.Plot,
 	infoList *widgets.List, stateGauge, wearGauge *widgets.Gauge, table *widgets.Table) {
 
+	// Всегда устанавливаем основные виджеты
 	batteryChart.SetRect(layout.BatteryChart.X1, layout.BatteryChart.Y1,
 		layout.BatteryChart.X2, layout.BatteryChart.Y2)
-	capacityChart.SetRect(layout.CapacityChart.X1, layout.CapacityChart.Y1,
-		layout.CapacityChart.X2, layout.CapacityChart.Y2)
 	infoList.SetRect(layout.InfoList.X1, layout.InfoList.Y1,
 		layout.InfoList.X2, layout.InfoList.Y2)
-	stateGauge.SetRect(layout.StateGauge.X1, layout.StateGauge.Y1,
-		layout.StateGauge.X2, layout.StateGauge.Y2)
-	wearGauge.SetRect(layout.WearGauge.X1, layout.WearGauge.Y1,
-		layout.WearGauge.X2, layout.WearGauge.Y2)
-	table.SetRect(layout.Table.X1, layout.Table.Y1,
-		layout.Table.X2, layout.Table.Y2)
+
+	// Устанавливаем дополнительные виджеты только если у них есть размеры
+	if layout.CapacityChart.X2 > layout.CapacityChart.X1 && layout.CapacityChart.Y2 > layout.CapacityChart.Y1 {
+		capacityChart.SetRect(layout.CapacityChart.X1, layout.CapacityChart.Y1,
+			layout.CapacityChart.X2, layout.CapacityChart.Y2)
+	}
+	if layout.StateGauge.X2 > layout.StateGauge.X1 && layout.StateGauge.Y2 > layout.StateGauge.Y1 {
+		stateGauge.SetRect(layout.StateGauge.X1, layout.StateGauge.Y1,
+			layout.StateGauge.X2, layout.StateGauge.Y2)
+	}
+	if layout.WearGauge.X2 > layout.WearGauge.X1 && layout.WearGauge.Y2 > layout.WearGauge.Y1 {
+		wearGauge.SetRect(layout.WearGauge.X1, layout.WearGauge.Y1,
+			layout.WearGauge.X2, layout.WearGauge.Y2)
+	}
+	if layout.Table.X2 > layout.Table.X1 && layout.Table.Y2 > layout.Table.Y1 {
+		table.SetRect(layout.Table.X1, layout.Table.Y1,
+			layout.Table.X2, layout.Table.Y2)
+	}
 }
 
 // getDashboardHotkeys возвращает подсказки по горячим клавишам для дашборда
@@ -2070,7 +2141,7 @@ renderDashboard:
 		fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
 		fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
 		fmt.Sprintf("📉 Износ: %.1f%%", wear),
-		fmt.Sprintf("⏱️  Скорость: %.2f мАч/ч", robustRate),
+		fmt.Sprintf("⏱️ Скорость: %.2f мАч/ч", robustRate),
 		fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
 	}
 
@@ -2082,7 +2153,7 @@ renderDashboard:
 		} else if latest.Temperature < 20 {
 			tempEmoji = "❄️"
 		}
-		infoRows = append(infoRows, fmt.Sprintf("%s Температура: %d°C", tempEmoji, latest.Temperature))
+		infoRows = append(infoRows, fmt.Sprintf("%sТемпература: %d°C", tempEmoji, latest.Temperature))
 	}
 
 	if healthAnalysis != nil {
@@ -2103,6 +2174,7 @@ renderDashboard:
 	stateGauge.Title = "Заряд батареи"
 	stateGauge.Percent = latest.Percentage
 	stateGauge.BarColor = ui.ColorGreen
+	stateGauge.BorderStyle = ui.NewStyle(ui.ColorWhite) // Явно задаем стиль границ
 	if latest.Percentage < 20 {
 		stateGauge.BarColor = ui.ColorRed
 	} else if latest.Percentage < 50 {
@@ -2114,6 +2186,7 @@ renderDashboard:
 	wearGauge.Title = "Износ батареи"
 	wearGauge.Percent = int(wear)
 	wearGauge.BarColor = ui.ColorRed
+	wearGauge.BorderStyle = ui.NewStyle(ui.ColorWhite) // Явно задаем стиль границ
 
 	// Таблица последних измерений
 	table := widgets.NewTable()
@@ -2121,25 +2194,66 @@ renderDashboard:
 	table.Rows = [][]string{
 		{"Время", "Заряд", "Состояние", "Емкость"},
 	}
-	for i := len(measurements) - 5; i < len(measurements) && i >= 0; i++ {
-		if i < 0 {
-			continue
-		}
-		m := measurements[i]
-		timeStr := m.Timestamp[11:19] // только время
-		table.Rows = append(table.Rows, []string{
-			timeStr,
-			fmt.Sprintf("%d%%", m.Percentage),
-			m.State,
-			fmt.Sprintf("%d мАч", m.CurrentCapacity),
-		})
-	}
-	// Применяем адаптивный лейаут
+	// Устанавливаем фиксированную ширину колонок для правильного выравнивания
+	// Увеличиваем ширину колонок для корректного отображения
+	table.ColumnWidths = []int{10, 8, 12, 12}
+
+	// Вычисляем сколько строк поместится в таблице
+	// Применяем лейаут сначала чтобы узнать размеры
 	layout := calculateLayout()
+
+	// Проверяем, должна ли таблица отображаться (не нулевые размеры)
+	if layout.Table.X2 > layout.Table.X1 && layout.Table.Y2 > layout.Table.Y1 {
+		// Высота таблицы = Y2 - Y1, минус 3 строки на рамки и заголовок
+		tableHeight := layout.Table.Y2 - layout.Table.Y1 - 3
+		if tableHeight > 0 {
+			maxRows := max(1, min(tableHeight, len(measurements))) // Минимум 1 строка, максимум сколько поместится
+
+			// Добавляем строки начиная с самых последних
+			start := max(0, len(measurements)-maxRows)
+			for i := start; i < len(measurements); i++ {
+				m := measurements[i]
+				timeStr := m.Timestamp[11:19] // только время
+				table.Rows = append(table.Rows, []string{
+					timeStr,
+					fmt.Sprintf("%3d%%", m.Percentage), // Фиксированная ширина для процентов
+					m.State,
+					fmt.Sprintf("%4d мАч", m.CurrentCapacity), // Фиксированная ширина для емкости
+				})
+			}
+		}
+	}
+
+	// Применяем адаптивный лейаут
 	applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
 
+	// Функция для создания списка виджетов к отображению
+	getVisibleWidgets := func(currentLayout DashboardLayout) []ui.Drawable {
+		var widgets []ui.Drawable
+
+		// Основные виджеты (всегда отображаются)
+		widgets = append(widgets, batteryChart, infoList)
+
+		// Дополнительные виджеты только если они имеют размеры
+		if currentLayout.CapacityChart.X2 > currentLayout.CapacityChart.X1 && currentLayout.CapacityChart.Y2 > currentLayout.CapacityChart.Y1 {
+			widgets = append(widgets, capacityChart)
+		}
+		if currentLayout.StateGauge.X2 > currentLayout.StateGauge.X1 && currentLayout.StateGauge.Y2 > currentLayout.StateGauge.Y1 {
+			widgets = append(widgets, stateGauge)
+		}
+		if currentLayout.WearGauge.X2 > currentLayout.WearGauge.X1 && currentLayout.WearGauge.Y2 > currentLayout.WearGauge.Y1 {
+			widgets = append(widgets, wearGauge)
+		}
+		if currentLayout.Table.X2 > currentLayout.Table.X1 && currentLayout.Table.Y2 > currentLayout.Table.Y1 {
+			widgets = append(widgets, table)
+		}
+
+		return widgets
+	}
+
 	render := func() {
-		ui.Render(batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
+		widgets := getVisibleWidgets(layout)
+		ui.Render(widgets...)
 	}
 
 	render()
@@ -2162,8 +2276,8 @@ renderDashboard:
 				return nil
 			case "<Resize>":
 				// Обработка изменения размера терминала
-				newLayout := calculateLayout()
-				applyLayout(newLayout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
+				layout = calculateLayout() // Обновляем переменную layout
+				applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
 				ui.Clear()
 				render()
 			case "r":
@@ -2195,7 +2309,7 @@ renderDashboard:
 						fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
 						fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
 						fmt.Sprintf("📉 Износ: %.1f%%", wear),
-						fmt.Sprintf("⏱️  Скорость: %.2f мАч/ч", robustRate),
+						fmt.Sprintf("⏱️ Скорость: %.2f мАч/ч", robustRate),
 						fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
 					}
 
@@ -2207,7 +2321,7 @@ renderDashboard:
 						} else if latest.Temperature < 20 {
 							tempEmoji = "❄️"
 						}
-						infoRows = append(infoRows, fmt.Sprintf("%s Температура: %d°C", tempEmoji, latest.Temperature))
+						infoRows = append(infoRows, fmt.Sprintf("%sТемпература: %d°C", tempEmoji, latest.Temperature))
 					}
 
 					if healthAnalysis != nil {
@@ -2224,8 +2338,8 @@ renderDashboard:
 					infoList.Rows = infoRows
 
 					// Обновляем лейаут на случай изменения размера
-					newLayout := calculateLayout()
-					applyLayout(newLayout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
+					layout = calculateLayout() // Обновляем переменную layout
+					applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
 
 					render()
 				}
@@ -2308,7 +2422,7 @@ renderDashboard:
 					fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
 					fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
 					fmt.Sprintf("📉 Износ: %.1f%%", wear),
-					fmt.Sprintf("⏱️  Скорость: %.2f мАч/ч", robustRate),
+					fmt.Sprintf("⏱️ Скорость: %.2f мАч/ч", robustRate),
 					fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
 				}
 
@@ -2320,7 +2434,7 @@ renderDashboard:
 					} else if latest.Temperature < 20 {
 						tempEmoji = "❄️"
 					}
-					infoRows = append(infoRows, fmt.Sprintf("%s Температура: %d°C", tempEmoji, latest.Temperature))
+					infoRows = append(infoRows, fmt.Sprintf("%sТемпература: %d°C", tempEmoji, latest.Temperature))
 				}
 
 				if healthAnalysis != nil {
@@ -2353,8 +2467,8 @@ renderDashboard:
 				}
 
 				// Обновляем лейаут на случай изменения размера
-				newLayout := calculateLayout()
-				applyLayout(newLayout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
+				layout = calculateLayout() // Обновляем переменную layout
+				applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
 
 				render()
 			}
@@ -2424,7 +2538,7 @@ func printReport(db *sqlx.DB) error {
 		} else if latest.Temperature > 35 {
 			tempLevel = "warning"
 		}
-		printColoredStatus("🌡️  Температура", fmt.Sprintf("%d°C", latest.Temperature), tempLevel)
+		printColoredStatus("🌡️ Температура", fmt.Sprintf("%d°C", latest.Temperature), tempLevel)
 	}
 
 	fmt.Println()
