@@ -6,6 +6,23 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза (например: v1.0.2)'
+        required: true
+        default: 'v1.0.0'
+        type: string
+      prerelease:
+        description: 'Отметить как pre-release (тестовая версия)'
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: 'Создать как черновик'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -64,21 +81,38 @@ jobs:
     - name: 📊 Get version info
       id: version
       run: |
-        if [[ $GITHUB_REF == refs/tags/* ]]; then
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          echo "is_tag=true" >> $GITHUB_OUTPUT
+          echo "is_manual=true" >> $GITHUB_OUTPUT
+        elif [[ $GITHUB_REF == refs/tags/* ]]; then
           echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           echo "is_tag=true" >> $GITHUB_OUTPUT
+          echo "is_manual=false" >> $GITHUB_OUTPUT
         else
           echo "version=dev-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
           echo "is_tag=false" >> $GITHUB_OUTPUT
+          echo "is_manual=false" >> $GITHUB_OUTPUT
         fi
+
+    - name: 🏷️ Create tag for manual release
+      if: steps.version.outputs.is_manual == 'true'
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git tag -a ${{ steps.version.outputs.version }} -m "Release ${{ steps.version.outputs.version }}"
+        git push origin ${{ steps.version.outputs.version }}
 
     - name: 🚀 Create Release (for tags only)
       if: steps.version.outputs.is_tag == 'true'
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ steps.version.outputs.version }}
         files: |
           dist/BatMon.zip
           dist/BatMon.zip.sha256
+        draft: ${{ github.event.inputs.draft == 'true' }}
+        prerelease: ${{ github.event.inputs.prerelease == 'true' }}
         body: |
           ## 🔋 BatMon ${{ steps.version.outputs.version }}
           
