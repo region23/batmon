@@ -418,11 +418,14 @@ type AdvancedMetrics struct {
 type AppState int
 
 const (
-	StateMenu AppState = iota
+	StateWelcome AppState = iota
+	StateMenu
 	StateDashboard
 	StateReport
+	StateQuickDiag
 	StateExport
 	StateSettings
+	StateHelp
 )
 
 // App - основная модель приложения Bubble Tea
@@ -518,11 +521,13 @@ type InfoItem struct {
 
 // DataService - сервис для работы с данными батареи
 type DataService struct {
-	collector *DataCollector
-	db        *sqlx.DB
-	buffer    *MemoryBuffer
-	ctx       context.Context
-	cancel    context.CancelFunc
+	collector        *DataCollector
+	db               *sqlx.DB
+	buffer           *MemoryBuffer
+	ctx              context.Context
+	cancel           context.CancelFunc
+	caffeinate       *exec.Cmd
+	caffeineActive   bool
 }
 
 // menuItem реализует list.Item интерфейс
@@ -2290,6 +2295,18 @@ func main() {
 
 	// Запуск интерфейса Bubble Tea
 	app := NewApp()
+	
+	// Обработка сигналов для корректного завершения caffeinate
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		if app.dataService != nil {
+			app.dataService.Stop()
+		}
+		os.Exit(0)
+	}()
+	
 	p := tea.NewProgram(app, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("❌ Ошибка запуска приложения: %v", err)
@@ -2852,12 +2869,57 @@ func NewDataService(db *sqlx.DB, buffer *MemoryBuffer) *DataService {
 
 // Start запускает фоновый сбор данных
 func (ds *DataService) Start() {
+	ds.startCaffeinate()
 	go ds.collectData()
 }
 
 // Stop останавливает сбор данных
 func (ds *DataService) Stop() {
+	ds.stopCaffeinate()
 	ds.cancel()
+}
+
+// startCaffeinate запускает caffeinate для предотвращения засыпания
+func (ds *DataService) startCaffeinate() {
+	if ds.caffeineActive {
+		return
+	}
+	
+	// Используем -i флаг для предотвращения idle засыпания
+	// Это не мешает засыпанию при закрытии крышки
+	ds.caffeinate = exec.CommandContext(ds.ctx, "caffeinate", "-i")
+	
+	err := ds.caffeinate.Start()
+	if err != nil {
+		log.Printf("Предупреждение: не удалось запустить caffeinate: %v", err)
+		return
+	}
+	
+	ds.caffeineActive = true
+	log.Println("✅ Предотвращение засыпания MacBook активировано")
+	
+	// Запускаем горутину для отслеживания завершения процесса
+	go func() {
+		ds.caffeinate.Wait()
+		ds.caffeineActive = false
+	}()
+}
+
+// stopCaffeinate останавливает caffeinate
+func (ds *DataService) stopCaffeinate() {
+	if !ds.caffeineActive || ds.caffeinate == nil {
+		return
+	}
+	
+	err := ds.caffeinate.Process.Kill()
+	if err != nil {
+		log.Printf("Предупреждение: не удалось остановить caffeinate: %v", err)
+	} else {
+		log.Println("🛌 Предотвращение засыпания MacBook отключено")
+	}
+	
+	ds.caffeineActive = false
+	ds.caffeinate = nil
 }
 
 // collectData выполняет фоновый сбор данных
@@ -2936,10 +2998,12 @@ func NewApp() *App {
 	
 	// Создание главного меню
 	menuItems := []list.Item{
-		menuItem{title: "🔋 Интерактивный мониторинг", desc: "Мониторинг батареи в реальном времени"},
-		menuItem{title: "📊 Детальный отчет", desc: "Анализ всех сохраненных данных"},
-		menuItem{title: "📄 Экспорт отчетов", desc: "Сохранение в Markdown или HTML"},
-		menuItem{title: "🗑️  Очистить БД", desc: "Удалить все сохраненные данные"},
+		menuItem{title: "🔋 Полный анализ батареи (100% → 0%)", desc: "Запустите при 100% заряде, разрядите до 0% для полной диагностики"},
+		menuItem{title: "⚡ Быстрая диагностика", desc: "Проверить текущее состояние батареи и показать рекомендации"},
+		menuItem{title: "📊 Детальный отчет", desc: "Анализ всех сохраненных данных с графиками и прогнозами"},
+		menuItem{title: "📄 Экспорт отчетов", desc: "Сохранить результаты в Markdown или HTML с графиками"},
+		menuItem{title: "🗑️  Очистить данные", desc: "Удалить все сохраненные измерения (начать заново)"},
+		menuItem{title: "❓ Справка", desc: "Как правильно использовать программу для анализа батареи"},
 		menuItem{title: "❌ Выход", desc: "Завершить работу программы"},
 	}
 	
@@ -2947,7 +3011,7 @@ func NewApp() *App {
 	menuList.Title = "🔋 BatMon - Мониторинг батареи MacBook"
 	
 	return &App{
-		state: StateMenu,
+		state: StateWelcome,
 		menu: MenuModel{
 			list: menuList,
 		},
@@ -2975,16 +3039,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		
 	case tea.KeyMsg:
 		switch a.state {
+		case StateWelcome:
+			return a.updateWelcome(msg)
 		case StateMenu:
 			return a.updateMenu(msg)
 		case StateDashboard:
 			return a.updateDashboard(msg)
 		case StateReport:
 			return a.updateReport(msg)
+		case StateQuickDiag:
+			return a.updateQuickDiag(msg)
 		case StateExport:
 			return a.updateExport(msg)
 		case StateSettings:
 			return a.updateSettings(msg)
+		case StateHelp:
+			return a.updateHelp(msg)
 		}
 		
 	case tickMsg:
@@ -3015,16 +3085,21 @@ func (a *App) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		selected := a.menu.list.SelectedItem()
 		if item, ok := selected.(menuItem); ok {
 			switch item.title {
-			case "🔋 Интерактивный мониторинг":
+			case "🔋 Полный анализ батареи (100% → 0%)":
 				a.state = StateDashboard
 				a.initDashboard()
+			case "⚡ Быстрая диагностика":
+				a.state = StateQuickDiag
+				a.initQuickDiag()
 			case "📊 Детальный отчет":
 				a.state = StateReport
 				a.initReport()
 			case "📄 Экспорт отчетов":
 				a.state = StateExport
-			case "🗑️  Очистить БД":
+			case "🗑️  Очистить данные":
 				a.state = StateSettings
+			case "❓ Справка":
+				a.state = StateHelp
 			case "❌ Выход":
 				a.dataService.Stop()
 				return a, tea.Quit
@@ -3209,19 +3284,58 @@ func (a *App) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+// updateWelcome обрабатывает нажатия в экране приветствия
+func (a *App) updateWelcome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й":
+		a.dataService.Stop()
+		return a, tea.Quit
+	case "enter", " ":
+		a.state = StateMenu
+		return a, nil
+	}
+	return a, nil
+}
+
+// updateQuickDiag обрабатывает нажатия в режиме быстрой диагностики  
+func (a *App) updateQuickDiag(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й":
+		a.state = StateMenu
+		return a, nil
+	}
+	return a, nil
+}
+
+// updateHelp обрабатывает нажатия в режиме справки
+func (a *App) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й":
+		a.state = StateMenu
+		return a, nil
+	}
+	return a, nil
+}
+
 // View рендерит интерфейс
 func (a *App) View() string {
 	switch a.state {
+	case StateWelcome:
+		return a.renderWelcome()
 	case StateMenu:
 		return a.renderMenu()
 	case StateDashboard:
 		return a.renderDashboard()
 	case StateReport:
 		return a.renderReport()
+	case StateQuickDiag:
+		return a.renderQuickDiag()
 	case StateExport:
 		return a.renderExport()
 	case StateSettings:
 		return a.renderSettings()
+	case StateHelp:
+		return a.renderHelp()
 	default:
 		return "Неизвестное состояние приложения"
 	}
@@ -3253,16 +3367,50 @@ func (a *App) renderDashboard() string {
 
 // renderLoadingScreen показывает экран загрузки
 func (a *App) renderLoadingScreen() string {
-	loading := "🔄 Загрузка данных батареи...\n\nПодождите, идет сбор информации о состоянии батареи."
+	title := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true).
+		Render("🔋 ПОЛНЫЙ АНАЛИЗ БАТАРЕИ") + "\n\n"
+		
+	loading := "🔄 Собираем данные о батарее...\n\n"
+	
+	instructions := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("10")).
+		Bold(true).
+		Render("📋 ЧТО НУЖНО ДЕЛАТЬ:") + "\n"
+	instructions += "1. Оставьте программу работать\n"
+	instructions += "2. Используйте MacBook как обычно\n"
+	instructions += "3. Разрядите батарею до 10-0%\n"
+	instructions += "4. После разрядки получите отчет\n\n"
+	
+	tips := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("11")).
+		Bold(true).
+		Render("💡 СОВЕТЫ:") + "\n"
+	tips += "• Минимум 2-3 часа для качественного анализа\n"
+	tips += "• Не закрывайте программу\n"
+	tips += "• При низком заряде сохраните работу\n\n"
+	
+	// Статус caffeinate
+	var caffeineStatus string
+	if a.dataService != nil && a.dataService.caffeineActive {
+		caffeineStatus = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("10")).
+			Render("☕ Предотвращение засыпания активно") + "\n\n"
+	}
+	
+	controls := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("8")).
+		Render("Нажмите 'q' для выхода в главное меню")
+	
+	content := title + loading + instructions + tips + caffeineStatus + controls
 	
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("39")).
 		Padding(2).
-		Align(lipgloss.Center).
-		Width(50).
-		Height(10).
-		Render(loading)
+		Width(60).
+		Render(content)
 }
 
 // renderCompactDashboard рендерит компактную версию для маленьких экранов
@@ -3380,6 +3528,19 @@ func (a *App) renderInfoPanel(width, height int) string {
 	batteryBar := a.dashboard.batteryGauge.ViewAs(batteryPercent)
 	wearBar := a.dashboard.wearGauge.ViewAs(wearPercent)
 	
+	// Вычисляем качество данных для анализа
+	dataPoints := len(a.measurements)
+	dataHours := float64(dataPoints) / 120.0 // примерно 120 измерений в час
+	dataQuality := "Недостаточно"
+	dataColor := "9" // красный
+	if dataHours >= 2.0 {
+		dataQuality = "Отлично"
+		dataColor = "10" // зеленый
+	} else if dataHours >= 1.0 {
+		dataQuality = "Хорошо"
+		dataColor = "11" // желтый
+	}
+	
 	content := fmt.Sprintf(`🔋 Текущее состояние
 
 ⚡ Заряд: %d%%
@@ -3394,7 +3555,10 @@ func (a *App) renderInfoPanel(width, height int) string {
 ⚡ Напряжение: %d мВ
 🔌 Ток: %d мА
 
-💚 Здоровье: %s`,
+💚 Здоровье: %s
+
+📊 Качество данных: %s
+⏱️  Собрано: %.1fч (%d точек)`,
 		a.latest.Percentage,
 		batteryBar,
 		wear,
@@ -3405,6 +3569,9 @@ func (a *App) renderInfoPanel(width, height int) string {
 		a.latest.Voltage,
 		a.latest.Amperage,
 		getBatteryHealthStatus(wear, a.latest.CycleCount),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(dataColor)).Render(dataQuality),
+		dataHours,
+		dataPoints,
 	)
 	
 	return lipgloss.NewStyle().
@@ -3503,6 +3670,49 @@ func getBatteryColor(percentage int) lipgloss.Color {
 		return lipgloss.Color("226") // Желтый
 	default:
 		return lipgloss.Color("196") // Красный
+	}
+}
+
+func getTemperatureColor(temp int) lipgloss.Color {
+	switch {
+	case temp <= 30:
+		return lipgloss.Color("46") // Зеленый
+	case temp <= 40:
+		return lipgloss.Color("226") // Желтый  
+	default:
+		return lipgloss.Color("196") // Красный
+	}
+}
+
+func getWearColor(wear float64) lipgloss.Color {
+	switch {
+	case wear < 10:
+		return lipgloss.Color("46") // Зеленый
+	case wear < 20:
+		return lipgloss.Color("226") // Желтый
+	default:
+		return lipgloss.Color("196") // Красный
+	}
+}
+
+func getCycleColor(cycles int) lipgloss.Color {
+	switch {
+	case cycles < 300:
+		return lipgloss.Color("46") // Зеленый
+	case cycles < 1000:
+		return lipgloss.Color("226") // Желтый
+	default:
+		return lipgloss.Color("196") // Красный
+	}
+}
+
+func getBatteryHealthColor(wear float64, cycles int) string {
+	if wear < 20 && cycles < 1000 {
+		return "10" // Зеленый
+	} else if wear < 30 && cycles < 1500 {
+		return "11" // Желтый
+	} else {
+		return "9" // Красный
 	}
 }
 
@@ -4710,6 +4920,271 @@ func (a *App) renderSettings() string {
 		BorderForeground(lipgloss.Color("240")).
 		Padding(1).
 		Render(content)
+}
+
+// renderHelp рендерит экран справки
+func (a *App) renderHelp() string {
+	// Адаптируем размер к размеру терминала
+	maxWidth := 70
+	if a.windowWidth > 0 && a.windowWidth < 80 {
+		maxWidth = a.windowWidth - 10
+	}
+	
+	title := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true).
+		Align(lipgloss.Center).
+		Render("🔋 Справка по BatMon") + "\n\n"
+		
+	// Основная цель
+	purpose := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("10")).
+		Bold(true).
+		Render("🎯 ГЛАВНАЯ ЦЕЛЬ") + "\n"
+	purpose += "Понять, нужно ли менять батарею MacBook\n\n"
+	
+	// Краткая инструкция
+	howTo := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("12")).
+		Bold(true).
+		Render("🚀 КАК ПОЛЬЗОВАТЬСЯ") + "\n"
+	howTo += "1. Зарядите до 100%\n"
+	howTo += "2. Выберите '🔋 Полный анализ батареи'\n"
+	howTo += "3. Разрядите до 0-10% (2-3 часа)\n"
+	howTo += "4. Получите рекомендацию\n\n"
+	
+	// Режимы
+	modes := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("11")).
+		Bold(true).
+		Render("📋 РЕЖИМЫ РАБОТЫ") + "\n"
+	modes += "⚡ Быстрая диагностика - моментальная проверка\n"
+	modes += "🔋 Полный анализ - основной тест (100%→0%)\n"
+	modes += "📊 Детальный отчет - графики и тренды\n\n"
+	
+	// Критерии оценки
+	criteria := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("9")).
+		Bold(true).
+		Render("🔍 ОЦЕНКА СОСТОЯНИЯ") + "\n"
+	criteria += lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("✅ Хорошо: ") + "износ <20%, циклы <1000\n"
+	criteria += lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render("⚠️  Внимание: ") + "износ 20-30%, циклы 1000+\n"
+	criteria += lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render("🔴 Замена: ") + "износ >30%, циклы >1500\n\n"
+	
+	// Советы
+	tips := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("14")).
+		Bold(true).
+		Render("💡 СОВЕТЫ") + "\n"
+	tips += "• Минимум 2-3 часа для точного анализа\n"
+	tips += "• Не закрывайте программу во время теста\n"
+	tips += "• MacBook не будет засыпать (кроме закрытия крышки)\n"
+	tips += "• Сохраняйте отчеты для отслеживания\n\n"
+	
+	// Управление
+	controls := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("8")).
+		Align(lipgloss.Center).
+		Render("Нажмите 'q' для выхода в главное меню")
+	
+	content := title + purpose + howTo + modes + criteria + tips + controls
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1).
+		Width(maxWidth).
+		Render(content)
+}
+
+// renderWelcome рендерит экран приветствия
+func (a *App) renderWelcome() string {
+	title := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true).
+		Align(lipgloss.Center).
+		Render("🔋 BatMon v2.0") + "\n"
+	
+	subtitle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("12")).
+		Bold(true).
+		Align(lipgloss.Center).
+		Render("Интеллектуальный анализ батареи MacBook") + "\n\n"
+		
+	purpose := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("10")).
+		Bold(true).
+		Render("🎯 ЦЕЛЬ ПРОГРАММЫ") + "\n"
+	purpose += "Помочь вам принять обоснованное решение:\n"
+	purpose += lipgloss.NewStyle().
+		Foreground(lipgloss.Color("11")).
+		Bold(true).
+		Render("НУЖНО ЛИ МЕНЯТЬ БАТАРЕЮ В ВАШЕМ MacBook?") + "\n\n"
+	
+	how := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("14")).
+		Bold(true).
+		Render("🔍 КАК ЭТО РАБОТАЕТ") + "\n"
+	how += "1. Программа собирает данные о работе батареи\n"
+	how += "2. Анализирует реальные показатели vs. заявленные\n"  
+	how += "3. Выявляет аномалии и проблемы\n"
+	how += "4. Даёт чёткую рекомендацию с обоснованием\n\n"
+	
+	example := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("9")).
+		Bold(true).
+		Render("⚠️ ЗАЧЕМ ЭТО НУЖНО") + "\n"
+	example += "Стандартные показатели macOS могут обманывать:\n"
+	example += "• Батарея показывает 5 часов, а садится за 2 часа\n"
+	example += "• Заряд резко проваливается с 90% до 40%\n"  
+	example += "• Перегрев при обычной нагрузке\n\n"
+	example += lipgloss.NewStyle().
+		Foreground(lipgloss.Color("10")).
+		Render("BatMon выявит такие проблемы и объяснит их причины!") + "\n\n"
+	
+	instruction := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("13")).
+		Bold(true).
+		Render("🚀 НАЧНЁМ!") + "\n"
+	instruction += "Для максимально точного анализа:\n"
+	instruction += "1. Зарядите MacBook до 100%\n"
+	instruction += "2. Выберите 'Полный анализ батареи'\n"  
+	instruction += "3. Используйте MacBook как обычно до разрядки\n"
+	instruction += "4. MacBook не будет засыпать (кроме закрытия крышки)\n\n"
+	
+	controls := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("8")).
+		Align(lipgloss.Center).
+		Render("Нажмите Enter или Пробел для продолжения\n") +
+		lipgloss.NewStyle().
+		Foreground(lipgloss.Color("8")).
+		Align(lipgloss.Center).
+		Render("'q' для выхода")
+	
+	content := title + subtitle + purpose + how + example + instruction + controls
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Padding(2).
+		Width(80).
+		Align(lipgloss.Center).
+		Render(content)
+}
+
+// renderQuickDiag рендерит быструю диагностику
+func (a *App) renderQuickDiag() string {
+	if a.latest == nil {
+		return lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("9")).
+			Padding(2).
+			Render("❌ Данные о батарее недоступны\n\nНажмите 'q' для выхода в меню")
+	}
+	
+	wear := computeWear(a.latest.DesignCapacity, a.latest.FullChargeCap)
+	healthStatus := getBatteryHealthStatus(wear, a.latest.CycleCount)
+	healthColor := getBatteryHealthColor(wear, a.latest.CycleCount)
+	
+	// Заголовок
+	title := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true).
+		Align(lipgloss.Center).
+		Render("⚡ БЫСТРАЯ ДИАГНОСТИКА БАТАРЕИ") + "\n\n"
+	
+	// Основные показатели
+	currentSection := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("12")).
+		Bold(true).
+		Render("📊 ТЕКУЩЕЕ СОСТОЯНИЕ") + "\n"
+	
+	currentSection += fmt.Sprintf("🔋 Заряд: %s\n", 
+		lipgloss.NewStyle().
+			Foreground(getBatteryColor(a.latest.Percentage)).
+			Bold(true).
+			Render(fmt.Sprintf("%d%%", a.latest.Percentage)))
+	
+	currentSection += fmt.Sprintf("🔄 Состояние: %s\n", formatBatteryState(a.latest.State))
+	currentSection += fmt.Sprintf("🌡️ Температура: %s\n", 
+		lipgloss.NewStyle().
+			Foreground(getTemperatureColor(a.latest.Temperature)).
+			Render(fmt.Sprintf("%d°C", a.latest.Temperature)))
+	currentSection += "\n"
+	
+	// Здоровье батареи
+	healthSection := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("10")).
+		Bold(true).
+		Render("💚 ЗДОРОВЬЕ БАТАРЕИ") + "\n"
+	
+	healthSection += fmt.Sprintf("📉 Износ: %s\n", 
+		lipgloss.NewStyle().
+			Foreground(getWearColor(wear)).
+			Bold(true).
+			Render(fmt.Sprintf("%.1f%%", wear)))
+	
+	healthSection += fmt.Sprintf("🔁 Циклы: %s\n", 
+		lipgloss.NewStyle().
+			Foreground(getCycleColor(a.latest.CycleCount)).
+			Render(fmt.Sprintf("%d", a.latest.CycleCount)))
+	
+	healthSection += fmt.Sprintf("💚 Общая оценка: %s\n\n", 
+		lipgloss.NewStyle().
+			Foreground(lipgloss.Color(healthColor)).
+			Bold(true).
+			Render(healthStatus))
+	
+	// Быстрая рекомендация
+	recommendationSection := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("11")).
+		Bold(true).
+		Render("🎯 БЫСТРАЯ РЕКОМЕНДАЦИЯ") + "\n"
+	
+	var recommendation string
+	if wear < 20 && a.latest.CycleCount < 1000 {
+		recommendation = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("10")).
+			Render("✅ Батарея в хорошем состоянии. Замена не требуется.")
+	} else if wear < 30 && a.latest.CycleCount < 1500 {
+		recommendation = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("11")).
+			Render("⚠️ Батарея работает, но стоит планировать замену.")
+	} else {
+		recommendation = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("9")).
+			Render("🔴 Рекомендуется замена батареи.")
+	}
+	recommendationSection += recommendation + "\n\n"
+	
+	// Дополнительные советы
+	tipsSection := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("14")).
+		Bold(true).
+		Render("💡 СОВЕТ") + "\n"
+	tipsSection += "Для полного анализа выберите '🔋 Полный анализ батареи'\n"
+	tipsSection += "или '📊 Детальный отчет' для графиков и трендов\n\n"
+	
+	// Управление
+	controls := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("8")).
+		Align(lipgloss.Center).
+		Render("Нажмите 'q' для выхода в главное меню")
+	
+	content := title + currentSection + healthSection + recommendationSection + tipsSection + controls
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Padding(2).
+		Width(70).
+		Render(content)
+}
+
+// initQuickDiag инициализирует быструю диагностику
+func (a *App) initQuickDiag() {
+	// Быстрая диагностика не требует специальной инициализации
+	// Все данные берутся из текущего состояния
 }
 
 // initDashboard инициализирует dashboard

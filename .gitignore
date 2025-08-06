@@ -5,6 +5,7 @@ batmon
 *.sqlite-wal
 *.log
 *.tmp
+*.html
 
 advanced_report.html
 advanced_report.md
