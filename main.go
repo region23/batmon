@@ -25,10 +25,14 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	ui "github.com/gizak/termui/v3"
-	"github.com/gizak/termui/v3/widgets"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
+	
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
 )
 
 const (
@@ -409,6 +413,127 @@ type AdvancedMetrics struct {
 	HealthRating       int     `json:"health_rating"`       // Общий рейтинг здоровья (0-100)
 	AppleStatus        string  `json:"apple_status"`        // Статус от Apple (Normal, Replace Soon, etc.)
 }
+
+// Bubble Tea приложение типы
+type AppState int
+
+const (
+	StateMenu AppState = iota
+	StateDashboard
+	StateReport
+	StateExport
+	StateSettings
+)
+
+// App - основная модель приложения Bubble Tea
+type App struct {
+	state        AppState
+	windowWidth  int
+	windowHeight int
+	
+	// Компоненты
+	menu       MenuModel
+	dashboard  DashboardModel
+	report     ReportModel
+	
+	// Сервисы
+	dataService *DataService
+	
+	// Общие данные
+	measurements []Measurement
+	latest       *Measurement
+	
+	// Экспорт
+	exportStatus string
+	
+	// Скроллинг отчета
+	reportScrollY int
+	
+	// Ошибки
+	lastError error
+}
+
+// MenuModel - модель главного меню
+type MenuModel struct {
+	list   list.Model
+	choice string
+}
+
+// DashboardModel - модель интерактивного dashboard
+type DashboardModel struct {
+	batteryChart  ChartModel
+	capacityChart ChartModel
+	infoList      InfoListModel
+	batteryGauge  progress.Model
+	wearGauge     progress.Model
+	measureTable  table.Model
+	
+	lastUpdate time.Time
+	updating   bool
+}
+
+// ReportModel - модель детального отчета
+type ReportModel struct {
+	content       string
+	scrollY       int
+	viewHeight    int
+	activeTab     int               // Активная вкладка
+	tabs          []string          // Список вкладок
+	widgets       []ReportWidget    // Виджеты для отображения
+	historyTable  table.Model       // Таблица истории
+	filterState   string            // Фильтр для истории
+	sortColumn    int               // Колонка для сортировки
+	sortDesc      bool              // Направление сортировки
+	lastUpdate    time.Time         // Время последнего обновления
+	animationTick int               // Счетчик для анимаций
+}
+
+// ReportWidget - виджет для отображения в отчете
+type ReportWidget struct {
+	title   string
+	content string
+	widgetType string // "gauge", "chart", "info", "alert"
+	value   float64
+	maxValue float64
+	color   lipgloss.Color
+	icon    string
+}
+
+// ChartModel - кастомная модель для ASCII графиков (заменено на charts.go)  
+type ChartModel struct {
+	title string
+	data  []float64
+}
+
+// InfoListModel - модель информационного списка
+type InfoListModel struct {
+	items []InfoItem
+}
+
+type InfoItem struct {
+	label string
+	value string
+	icon  string
+}
+
+// DataService - сервис для работы с данными батареи
+type DataService struct {
+	collector *DataCollector
+	db        *sqlx.DB
+	buffer    *MemoryBuffer
+	ctx       context.Context
+	cancel    context.CancelFunc
+}
+
+// menuItem реализует list.Item интерфейс
+type menuItem struct {
+	title string
+	desc  string
+}
+
+func (i menuItem) FilterValue() string { return i.title }
+func (i menuItem) Title() string       { return i.title }
+func (i menuItem) Description() string { return i.desc }
 
 // initDB открывает соединение с SQLite и создаёт таблицу, если её нет.
 func initDB(path string) (*sqlx.DB, error) {
@@ -1242,7 +1367,88 @@ func exportToHTML(data ReportData, filename string) error {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🔋 Отчет о состоянии батареи MacBook</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js" integrity="sha512-ElRFoEQdI5Ht6kZvyzXhYG9NqjtkmlkfYk0wr6wHxU9JEHakS7UJZNeml5ALk+8IKlU6jDgMabC3vkumRokgJA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+        // Fallback: встроенная минимальная версия Chart.js если CDN недоступен
+        if (typeof Chart === 'undefined') {
+            // Простая замена Chart.js для автономной работы
+            window.Chart = function(ctx, config) {
+                var canvas = ctx.canvas || ctx;
+                var context = canvas.getContext('2d');
+                
+                // Очищаем canvas
+                context.clearRect(0, 0, canvas.width, canvas.height);
+                
+                if (config.type === 'line' && config.data && config.data.datasets) {
+                    var data = config.data.datasets[0].data;
+                    var labels = config.data.labels;
+                    
+                    if (data && data.length > 0) {
+                        // Настройки графика
+                        var padding = 40;
+                        var width = canvas.width - 2 * padding;
+                        var height = canvas.height - 2 * padding;
+                        
+                        // Найдем min и max значения
+                        var minVal = Math.min(...data);
+                        var maxVal = Math.max(...data);
+                        var range = maxVal - minVal;
+                        if (range === 0) range = 1;
+                        
+                        // Рисуем оси
+                        context.strokeStyle = '#666';
+                        context.lineWidth = 1;
+                        context.beginPath();
+                        context.moveTo(padding, padding);
+                        context.lineTo(padding, height + padding);
+                        context.lineTo(width + padding, height + padding);
+                        context.stroke();
+                        
+                        // Рисуем данные
+                        if (data.length > 1) {
+                            context.strokeStyle = config.data.datasets[0].borderColor || '#007AFF';
+                            context.lineWidth = 2;
+                            context.beginPath();
+                            
+                            for (var i = 0; i < data.length; i++) {
+                                var x = padding + (i / (data.length - 1)) * width;
+                                var y = height + padding - ((data[i] - minVal) / range) * height;
+                                
+                                if (i === 0) {
+                                    context.moveTo(x, y);
+                                } else {
+                                    context.lineTo(x, y);
+                                }
+                            }
+                            context.stroke();
+                        }
+                        
+                        // Подписи осей
+                        context.fillStyle = '#333';
+                        context.font = '12px Arial';
+                        context.textAlign = 'center';
+                        
+                        // Y-axis labels
+                        context.textAlign = 'right';
+                        context.fillText(maxVal.toFixed(0), padding - 10, padding + 5);
+                        context.fillText(minVal.toFixed(0), padding - 10, height + padding + 5);
+                        
+                        // Заголовок
+                        if (config.options && config.options.plugins && config.options.plugins.title && config.options.plugins.title.text) {
+                            context.textAlign = 'center';
+                            context.font = 'bold 16px Arial';
+                            context.fillText(config.options.plugins.title.text, canvas.width / 2, 20);
+                        }
+                    }
+                }
+                
+                return {
+                    update: function() {},
+                    destroy: function() {}
+                };
+            };
+        }
+    </script>
     <style>
         body { 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
@@ -1720,6 +1926,11 @@ func (dc *DataCollector) collectAndStore() error {
 			m.DesignCapacity = latest.DesignCapacity
 			m.CurrentCapacity = latest.CurrentCapacity
 			m.Temperature = latest.Temperature
+			// Копируем также значения напряжения, тока и мощности
+			m.Voltage = latest.Voltage
+			m.Amperage = latest.Amperage
+			m.Power = latest.Power
+			m.AppleCondition = latest.AppleCondition
 		}
 	}
 
@@ -1760,6 +1971,11 @@ func (dc *DataCollector) GetStats() (map[string]interface{}, error) {
 	dbStats["buffer_max_size"] = dc.buffer.maxSize
 
 	return dbStats, nil
+}
+
+// CollectAndStore - публичная обертка для collectAndStore
+func (dc *DataCollector) CollectAndStore() error {
+	return dc.collectAndStore()
 }
 
 // backgroundDataCollection запускает фоновый сбор данных с оптимизацией
@@ -1861,620 +2077,7 @@ func normalizeKeyInput(keyID string) string {
 	return keyID
 }
 
-// DashboardLayout содержит размеры и позиции всех виджетов дашборда
-type DashboardLayout struct {
-	BatteryChart  struct{ X1, Y1, X2, Y2 int }
-	CapacityChart struct{ X1, Y1, X2, Y2 int }
-	InfoList      struct{ X1, Y1, X2, Y2 int }
-	StateGauge    struct{ X1, Y1, X2, Y2 int }
-	WearGauge     struct{ X1, Y1, X2, Y2 int }
-	Table         struct{ X1, Y1, X2, Y2 int }
-}
 
-// calculateLayout вычисляет адаптивный лейаут в зависимости от размера терминала
-func calculateLayout() DashboardLayout {
-	termWidth, termHeight := ui.TerminalDimensions()
-
-	var layout DashboardLayout
-
-	// Для очень маленьких терминалов - упрощенный лейаут
-	if termWidth < 60 || termHeight < 20 {
-		// Минимальные размеры для упрощенного лейаута
-		if termWidth < 40 {
-			termWidth = 40
-		}
-		if termHeight < 15 {
-			termHeight = 15
-		}
-
-		// Упрощенный лейаут: только основные элементы
-		halfHeight := termHeight / 2
-
-		layout.BatteryChart.X1 = 0
-		layout.BatteryChart.Y1 = 0
-		layout.BatteryChart.X2 = termWidth
-		layout.BatteryChart.Y2 = halfHeight
-
-		layout.InfoList.X1 = 0
-		layout.InfoList.Y1 = halfHeight
-		layout.InfoList.X2 = termWidth
-		layout.InfoList.Y2 = termHeight
-
-		// Остальные виджеты скрываем (нулевые размеры)
-		layout.CapacityChart = layout.BatteryChart // Дублируем чтобы не было ошибок
-		layout.StateGauge.X1 = 0
-		layout.StateGauge.Y1 = 0
-		layout.StateGauge.X2 = 0
-		layout.StateGauge.Y2 = 0
-		layout.WearGauge.X1 = 0
-		layout.WearGauge.Y1 = 0
-		layout.WearGauge.X2 = 0
-		layout.WearGauge.Y2 = 0
-		layout.Table.X1 = 0
-		layout.Table.Y1 = 0
-		layout.Table.X2 = 0
-		layout.Table.Y2 = 0
-
-		return layout
-	}
-
-	// Стандартные минимальные размеры
-	if termWidth < 80 {
-		termWidth = 80
-	}
-	if termHeight < 25 {
-		termHeight = 25
-	}
-
-	// Рассчитываем размеры относительно терминала
-	leftWidth := termWidth / 2
-	topHeight := (termHeight * 3) / 5 // 60% высоты для графиков
-	bottomHeight := termHeight - topHeight
-
-	// Убеждаемся, что нижняя область имеет минимальную высоту
-	if bottomHeight < 6 {
-		topHeight = termHeight - 6
-		bottomHeight = 6
-	}
-
-	// График заряда батареи (левый верхний)
-	layout.BatteryChart.X1 = 0
-	layout.BatteryChart.Y1 = 0
-	layout.BatteryChart.X2 = leftWidth
-	layout.BatteryChart.Y2 = topHeight
-
-	// График ёмкости (правый верхний) - добавляем отступ от левой колонки
-	layout.CapacityChart.X1 = leftWidth + 1
-	layout.CapacityChart.Y1 = 0
-	layout.CapacityChart.X2 = termWidth
-	layout.CapacityChart.Y2 = topHeight
-
-	// Информационный список (левый нижний) - уменьшаем правую границу на 1 символ
-	layout.InfoList.X1 = 0
-	layout.InfoList.Y1 = topHeight
-	layout.InfoList.X2 = leftWidth - 1
-	layout.InfoList.Y2 = termHeight
-
-	// Правая нижняя область: лучше разделить с минимальными размерами
-	gaugeHeight := max(4, bottomHeight/3) // Минимум 4 строки для каждого gauge
-
-	// Убеждаемся, что все виджеты помещаются
-	if gaugeHeight*2+6 > bottomHeight { // 6 = минимум для таблицы
-		gaugeHeight = max(4, (bottomHeight-6)/3) // Сжимаем gauges если не помещается, но не меньше 4
-	}
-
-	// Гистограмма заряда - добавляем отступ от левой колонки
-	layout.StateGauge.X1 = leftWidth + 1
-	layout.StateGauge.Y1 = topHeight
-	layout.StateGauge.X2 = termWidth
-	layout.StateGauge.Y2 = topHeight + gaugeHeight
-
-	// Гистограмма износа - добавляем отступ от левой колонки
-	layout.WearGauge.X1 = leftWidth + 1
-	layout.WearGauge.Y1 = topHeight + gaugeHeight
-	layout.WearGauge.X2 = termWidth
-	layout.WearGauge.Y2 = topHeight + 2*gaugeHeight
-
-	// Таблица последних измерений - добавляем отступ от левой колонки
-	layout.Table.X1 = leftWidth + 1
-	layout.Table.Y1 = topHeight + 2*gaugeHeight
-	layout.Table.X2 = termWidth
-	layout.Table.Y2 = termHeight
-
-	return layout
-}
-
-// applyLayout применяет рассчитанный лейаут к виджетам
-func applyLayout(layout DashboardLayout, batteryChart, capacityChart *widgets.Plot,
-	infoList *widgets.List, stateGauge, wearGauge *widgets.Gauge, table *widgets.Table) {
-
-	// Всегда устанавливаем основные виджеты
-	batteryChart.SetRect(layout.BatteryChart.X1, layout.BatteryChart.Y1,
-		layout.BatteryChart.X2, layout.BatteryChart.Y2)
-	infoList.SetRect(layout.InfoList.X1, layout.InfoList.Y1,
-		layout.InfoList.X2, layout.InfoList.Y2)
-
-	// Устанавливаем дополнительные виджеты только если у них есть размеры
-	if layout.CapacityChart.X2 > layout.CapacityChart.X1 && layout.CapacityChart.Y2 > layout.CapacityChart.Y1 {
-		capacityChart.SetRect(layout.CapacityChart.X1, layout.CapacityChart.Y1,
-			layout.CapacityChart.X2, layout.CapacityChart.Y2)
-	}
-	if layout.StateGauge.X2 > layout.StateGauge.X1 && layout.StateGauge.Y2 > layout.StateGauge.Y1 {
-		stateGauge.SetRect(layout.StateGauge.X1, layout.StateGauge.Y1,
-			layout.StateGauge.X2, layout.StateGauge.Y2)
-	}
-	if layout.WearGauge.X2 > layout.WearGauge.X1 && layout.WearGauge.Y2 > layout.WearGauge.Y1 {
-		wearGauge.SetRect(layout.WearGauge.X1, layout.WearGauge.Y1,
-			layout.WearGauge.X2, layout.WearGauge.Y2)
-	}
-	if layout.Table.X2 > layout.Table.X1 && layout.Table.Y2 > layout.Table.Y1 {
-		table.SetRect(layout.Table.X1, layout.Table.Y1,
-			layout.Table.X2, layout.Table.Y2)
-	}
-}
-
-// getDashboardHotkeys возвращает подсказки по горячим клавишам для дашборда
-func getDashboardHotkeys() []string {
-	return []string{
-		"",
-		"═══ ГОРЯЧИЕ КЛАВИШИ ═══",
-		"⌨️  'q'/'й' / Ctrl+C - Выход",
-		"🔄 'r'/'к' - Обновить данные",
-		"📊 'h'/'р' - Показать справку",
-		"📈 Автообновление: каждые 10с",
-		"🌍 Поддержка русской раскладки",
-	}
-}
-
-// safeUpdateChartData безопасно обновляет данные графиков с проверками
-func safeUpdateChartData(batteryChart, capacityChart *widgets.Plot, measurements []Measurement) {
-	if len(measurements) == 0 {
-		// Если данных нет, создаем минимальные данные для отображения
-		batteryChart.Data[0] = []float64{0, 0}
-		capacityChart.Data[0] = []float64{0, 0}
-		return
-	}
-
-	dataSize := len(measurements)
-	if dataSize < 2 {
-		// Дублируем единственную точку для корректной отрисовки
-		batteryChart.Data[0] = make([]float64, 2)
-		batteryChart.Data[0][0] = float64(measurements[0].Percentage)
-		batteryChart.Data[0][1] = float64(measurements[0].Percentage)
-		capacityChart.Data[0] = make([]float64, 2)
-		capacityChart.Data[0][0] = float64(measurements[0].CurrentCapacity)
-		capacityChart.Data[0][1] = float64(measurements[0].CurrentCapacity)
-	} else {
-		batteryChart.Data[0] = make([]float64, len(measurements))
-		capacityChart.Data[0] = make([]float64, len(measurements))
-		for i, m := range measurements {
-			batteryChart.Data[0][i] = float64(m.Percentage)
-			capacityChart.Data[0][i] = float64(m.CurrentCapacity)
-		}
-	}
-}
-
-// showDashboard отображает интерактивный дашборд в терминале
-func showDashboard(db *sqlx.DB, ctx context.Context) error {
-	if err := ui.Init(); err != nil {
-		return fmt.Errorf("инициализация UI: %w", err)
-	}
-	defer ui.Close()
-
-	// Получаем данные за последние 50 измерений
-	measurements, err := getLastNMeasurements(db, 50)
-	if err != nil {
-		return fmt.Errorf("получение данных: %w", err)
-	}
-
-	if len(measurements) == 0 {
-		// Если данных нет, показываем заглушку и ждем первых данных
-		placeholder := widgets.NewParagraph()
-		placeholder.Title = "Сбор данных"
-		placeholder.Text = "Ожидание первых измерений батареи...\nДанные появятся через несколько секунд.\n\n⌨️ Горячие клавиши:\n'q'/'й' / Ctrl+C - Выход\n'h'/'р' - Справка\n🌍 Поддержка русской раскладки"
-		placeholder.SetRect(0, 0, 80, 10)
-
-		ui.Render(placeholder)
-
-		// Ждем появления данных или выхода
-		uiEvents := ui.PollEvents()
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case e := <-uiEvents:
-				normalizedKey := normalizeKeyInput(e.ID)
-				if normalizedKey == "q" || e.ID == "<C-c>" {
-					return nil
-				}
-			case <-ticker.C:
-				measurements, err = getLastNMeasurements(db, 50)
-				if err == nil && len(measurements) > 0 {
-					goto renderDashboard
-				}
-			}
-		}
-	}
-
-renderDashboard:
-	// Еще раз проверяем, что данные есть (на случай goto)
-	if len(measurements) == 0 {
-		return fmt.Errorf("нет данных для отображения дашборда")
-	}
-
-	// График заряда батареи
-	batteryChart := widgets.NewPlot()
-	batteryChart.Title = "Заряд батареи (%)"
-	batteryChart.Data = make([][]float64, 1)
-
-	// График емкости
-	capacityChart := widgets.NewPlot()
-	capacityChart.Title = "Текущая емкость (мАч)"
-	capacityChart.Data = make([][]float64, 1)
-
-	// Безопасно инициализируем данные графиков
-	safeUpdateChartData(batteryChart, capacityChart, measurements)
-
-	// Стили графиков
-	batteryChart.AxesColor = ui.ColorWhite
-	batteryChart.LineColors[0] = ui.ColorGreen
-	capacityChart.AxesColor = ui.ColorWhite
-	capacityChart.LineColors[0] = ui.ColorBlue
-
-	// Текущая информация
-	latest := measurements[len(measurements)-1]
-	wear := computeWear(latest.DesignCapacity, latest.FullChargeCap)
-	robustRate, _ := computeAvgRateRobust(measurements, 10)
-	remaining := computeRemainingTime(latest.CurrentCapacity, robustRate)
-
-	// Анализ аномалий для дашборда
-	anomalies := detectBatteryAnomalies(measurements)
-	healthAnalysis := analyzeBatteryHealth(measurements)
-
-	infoList := widgets.NewList()
-	infoList.Title = "Текущее состояние"
-	infoRows := []string{
-		fmt.Sprintf("🔋 Заряд: %d%%", latest.Percentage),
-		fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
-		fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
-		fmt.Sprintf("📉 Износ: %.1f%%", wear),
-		fmt.Sprintf("⏱️ Скорость: %.2f мАч/ч", robustRate),
-		fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
-	}
-
-	// Добавляем температуру если доступна
-	if latest.Temperature > 0 {
-		tempEmoji := "🌡️"
-		if latest.Temperature > 40 {
-			tempEmoji = "🔥"
-		} else if latest.Temperature < 20 {
-			tempEmoji = "❄️"
-		}
-		infoRows = append(infoRows, fmt.Sprintf("%sТемпература: %d°C", tempEmoji, latest.Temperature))
-	}
-
-	if healthAnalysis != nil {
-		if status, ok := healthAnalysis["health_status"].(string); ok {
-			score, _ := healthAnalysis["health_score"].(int)
-			infoRows = append(infoRows, fmt.Sprintf("Здоровье: %s (%d/100)", status, score))
-		}
-		if len(anomalies) > 0 {
-			infoRows = append(infoRows, fmt.Sprintf("Аномалий: %d", len(anomalies)))
-		}
-	}
-
-	infoRows = append(infoRows, getDashboardHotkeys()...)
-	infoList.Rows = infoRows
-
-	// Гистограмма состояний
-	stateGauge := widgets.NewGauge()
-	stateGauge.Title = "Заряд батареи"
-	stateGauge.Percent = latest.Percentage
-	stateGauge.BarColor = ui.ColorGreen
-	stateGauge.BorderStyle = ui.NewStyle(ui.ColorWhite) // Явно задаем стиль границ
-	if latest.Percentage < 20 {
-		stateGauge.BarColor = ui.ColorRed
-	} else if latest.Percentage < 50 {
-		stateGauge.BarColor = ui.ColorYellow
-	}
-
-	// Износ батареи
-	wearGauge := widgets.NewGauge()
-	wearGauge.Title = "Износ батареи"
-	wearGauge.Percent = int(wear)
-	wearGauge.BarColor = ui.ColorRed
-	wearGauge.BorderStyle = ui.NewStyle(ui.ColorWhite) // Явно задаем стиль границ
-
-	// Таблица последних измерений
-	table := widgets.NewTable()
-	table.Title = "Последние измерения"
-	table.Rows = [][]string{
-		{"Время", "Заряд", "Состояние", "Емкость"},
-	}
-	// Устанавливаем фиксированную ширину колонок для правильного выравнивания
-	// Увеличиваем ширину колонок для корректного отображения
-	table.ColumnWidths = []int{10, 8, 12, 12}
-
-	// Вычисляем сколько строк поместится в таблице
-	// Применяем лейаут сначала чтобы узнать размеры
-	layout := calculateLayout()
-
-	// Проверяем, должна ли таблица отображаться (не нулевые размеры)
-	if layout.Table.X2 > layout.Table.X1 && layout.Table.Y2 > layout.Table.Y1 {
-		// Высота таблицы = Y2 - Y1, минус 3 строки на рамки и заголовок
-		tableHeight := layout.Table.Y2 - layout.Table.Y1 - 3
-		if tableHeight > 0 {
-			maxRows := max(1, min(tableHeight, len(measurements))) // Минимум 1 строка, максимум сколько поместится
-
-			// Добавляем строки начиная с самых последних
-			start := max(0, len(measurements)-maxRows)
-			for i := start; i < len(measurements); i++ {
-				m := measurements[i]
-				timeStr := m.Timestamp[11:19] // только время
-				table.Rows = append(table.Rows, []string{
-					timeStr,
-					fmt.Sprintf("%3d%%", m.Percentage), // Фиксированная ширина для процентов
-					m.State,
-					fmt.Sprintf("%4d мАч", m.CurrentCapacity), // Фиксированная ширина для емкости
-				})
-			}
-		}
-	}
-
-	// Применяем адаптивный лейаут
-	applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
-
-	// Функция для создания списка виджетов к отображению
-	getVisibleWidgets := func(currentLayout DashboardLayout) []ui.Drawable {
-		var widgets []ui.Drawable
-
-		// Основные виджеты (всегда отображаются)
-		widgets = append(widgets, batteryChart, infoList)
-
-		// Дополнительные виджеты только если они имеют размеры
-		if currentLayout.CapacityChart.X2 > currentLayout.CapacityChart.X1 && currentLayout.CapacityChart.Y2 > currentLayout.CapacityChart.Y1 {
-			widgets = append(widgets, capacityChart)
-		}
-		if currentLayout.StateGauge.X2 > currentLayout.StateGauge.X1 && currentLayout.StateGauge.Y2 > currentLayout.StateGauge.Y1 {
-			widgets = append(widgets, stateGauge)
-		}
-		if currentLayout.WearGauge.X2 > currentLayout.WearGauge.X1 && currentLayout.WearGauge.Y2 > currentLayout.WearGauge.Y1 {
-			widgets = append(widgets, wearGauge)
-		}
-		if currentLayout.Table.X2 > currentLayout.Table.X1 && currentLayout.Table.Y2 > currentLayout.Table.Y1 {
-			widgets = append(widgets, table)
-		}
-
-		return widgets
-	}
-
-	render := func() {
-		widgets := getVisibleWidgets(layout)
-		ui.Render(widgets...)
-	}
-
-	render()
-
-	uiEvents := ui.PollEvents()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case e := <-uiEvents:
-			// Нормализуем клавишу для поддержки разных раскладок
-			normalizedKey := normalizeKeyInput(e.ID)
-			switch normalizedKey {
-			case "q":
-				return nil
-			case "<C-c>":
-				return nil
-			case "<Resize>":
-				// Обработка изменения размера терминала
-				layout = calculateLayout() // Обновляем переменную layout
-				applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
-				ui.Clear()
-				render()
-			case "r":
-				// Обновляем данные
-				newMeasurements, err := getLastNMeasurements(db, 50)
-				if err == nil && len(newMeasurements) > 0 {
-					measurements = newMeasurements
-					latest = measurements[len(measurements)-1]
-
-					// Обновляем графики безопасно
-					safeUpdateChartData(batteryChart, capacityChart, measurements)
-
-					// Пересчитываем статистику
-					wear = computeWear(latest.DesignCapacity, latest.FullChargeCap)
-					robustRate, _ := computeAvgRateRobust(measurements, 10)
-					remaining = computeRemainingTime(latest.CurrentCapacity, robustRate)
-
-					// Обновляем анализ
-					anomalies = detectBatteryAnomalies(measurements)
-					healthAnalysis = analyzeBatteryHealth(measurements)
-
-					// Обновляем виджеты
-					stateGauge.Percent = latest.Percentage
-					wearGauge.Percent = int(wear)
-
-					// Обновляем информационный список
-					infoRows := []string{
-						fmt.Sprintf("🔋 Заряд: %d%%", latest.Percentage),
-						fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
-						fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
-						fmt.Sprintf("📉 Износ: %.1f%%", wear),
-						fmt.Sprintf("⏱️ Скорость: %.2f мАч/ч", robustRate),
-						fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
-					}
-
-					// Добавляем температуру если доступна
-					if latest.Temperature > 0 {
-						tempEmoji := "🌡️"
-						if latest.Temperature > 40 {
-							tempEmoji = "🔥"
-						} else if latest.Temperature < 20 {
-							tempEmoji = "❄️"
-						}
-						infoRows = append(infoRows, fmt.Sprintf("%sТемпература: %d°C", tempEmoji, latest.Temperature))
-					}
-
-					if healthAnalysis != nil {
-						if status, ok := healthAnalysis["health_status"].(string); ok {
-							score, _ := healthAnalysis["health_score"].(int)
-							infoRows = append(infoRows, fmt.Sprintf("Здоровье: %s (%d/100)", status, score))
-						}
-						if len(anomalies) > 0 {
-							infoRows = append(infoRows, fmt.Sprintf("Аномалий: %d", len(anomalies)))
-						}
-					}
-
-					infoRows = append(infoRows, getDashboardHotkeys()...)
-					infoList.Rows = infoRows
-
-					// Обновляем лейаут на случай изменения размера
-					layout = calculateLayout() // Обновляем переменную layout
-					applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
-
-					render()
-				}
-			case "h":
-				// Показываем справку
-				helpWidget := widgets.NewParagraph()
-				helpWidget.Title = "Справка - BatMon v2.0"
-				helpWidget.Text = `🔋 ИНТЕРАКТИВНЫЙ МОНИТОРИНГ БАТАРЕИ
-
-ОПИСАНИЕ ГРАФИКОВ:
-• Левый график - процент заряда батареи во времени
-• Правый график - текущая ёмкость в мАч во времени
-• Таблица - последние 5 измерений с временными метками
-
-ГОРЯЧИЕ КЛАВИШИ:
-• 'q'/'й' / Ctrl+C - выход из мониторинга
-• 'r'/'к' - принудительное обновление данных  
-• 'h'/'р' - показать эту справку (нажмите любую клавишу для возврата)
-🌍 Поддерживается русская раскладка клавиатуры
-
-ПОКАЗАТЕЛИ:
-• Заряд - текущий процент заряда батареи
-• Состояние - режим работы (заряжается/разряжается/подключен)
-• Циклы - количество полных циклов заряда-разряда
-• Износ - процент износа относительно заводской ёмкости
-• Скорость - текущая скорость разряда в мАч/час
-• Время - примерное оставшееся время работы
-
-Данные обновляются автоматически каждые 10 секунд.
-Нажмите любую клавишу для возврата к мониторингу...`
-
-				// Устанавливаем размер на весь экран
-				termWidth, termHeight := ui.TerminalDimensions()
-				helpWidget.SetRect(0, 0, termWidth, termHeight)
-
-				ui.Clear()
-				ui.Render(helpWidget)
-
-				// Ждем нажатия любой клавиши
-				for {
-					helpEvent := <-uiEvents
-					if helpEvent.Type == ui.KeyboardEvent {
-						ui.Clear()
-						render() // Возвращаем обычный дашборд
-						break
-					}
-				}
-			}
-		case <-ticker.C:
-			// Автоматическое обновление каждые 10 секунд
-			newMeasurements, err := getLastNMeasurements(db, 50)
-			if err == nil && len(newMeasurements) > 0 {
-				measurements = newMeasurements
-				latest = measurements[len(measurements)-1]
-				wear = computeWear(latest.DesignCapacity, latest.FullChargeCap)
-				robustRate, _ := computeAvgRateRobust(measurements, 10)
-				remaining = computeRemainingTime(latest.CurrentCapacity, robustRate)
-
-				// Обновляем все виджеты безопасно
-				safeUpdateChartData(batteryChart, capacityChart, measurements)
-
-				stateGauge.Percent = latest.Percentage
-				if latest.Percentage < 20 {
-					stateGauge.BarColor = ui.ColorRed
-				} else if latest.Percentage < 50 {
-					stateGauge.BarColor = ui.ColorYellow
-				} else {
-					stateGauge.BarColor = ui.ColorGreen
-				}
-
-				wearGauge.Percent = int(wear)
-
-				// Обновляем анализ
-				anomalies := detectBatteryAnomalies(measurements)
-				healthAnalysis := analyzeBatteryHealth(measurements)
-
-				// Обновляем информационный список
-				infoRows := []string{
-					fmt.Sprintf("🔋 Заряд: %d%%", latest.Percentage),
-					fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
-					fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
-					fmt.Sprintf("📉 Износ: %.1f%%", wear),
-					fmt.Sprintf("⏱️ Скорость: %.2f мАч/ч", robustRate),
-					fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
-				}
-
-				// Добавляем температуру если доступна
-				if latest.Temperature > 0 {
-					tempEmoji := "🌡️"
-					if latest.Temperature > 40 {
-						tempEmoji = "🔥"
-					} else if latest.Temperature < 20 {
-						tempEmoji = "❄️"
-					}
-					infoRows = append(infoRows, fmt.Sprintf("%sТемпература: %d°C", tempEmoji, latest.Temperature))
-				}
-
-				if healthAnalysis != nil {
-					if status, ok := healthAnalysis["health_status"].(string); ok {
-						score, _ := healthAnalysis["health_score"].(int)
-						infoRows = append(infoRows, fmt.Sprintf("Здоровье: %s (%d/100)", status, score))
-					}
-					if len(anomalies) > 0 {
-						infoRows = append(infoRows, fmt.Sprintf("Аномалий: %d", len(anomalies)))
-					}
-				}
-
-				infoRows = append(infoRows, getDashboardHotkeys()...)
-				infoList.Rows = infoRows // Обновляем таблицу последних измерений
-				table.Rows = [][]string{
-					{"Время", "Заряд", "Состояние", "Емкость"},
-				}
-				for i := len(measurements) - 5; i < len(measurements) && i >= 0; i++ {
-					if i < 0 {
-						continue
-					}
-					m := measurements[i]
-					timeStr := m.Timestamp[11:19]
-					table.Rows = append(table.Rows, []string{
-						timeStr,
-						fmt.Sprintf("%d%%", m.Percentage),
-						m.State,
-						fmt.Sprintf("%d мАч", m.CurrentCapacity),
-					})
-				}
-
-				// Обновляем лейаут на случай изменения размера
-				layout = calculateLayout() // Обновляем переменную layout
-				applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
-
-				render()
-			}
-		}
-	}
-}
 
 // printReport выводит отчёт о последнем измерении и статистике с цветным оформлением.
 func printReport(db *sqlx.DB) error {
@@ -2658,7 +2261,7 @@ func printReport(db *sqlx.DB) error {
 
 // main – точка входа программы.
 func main() {
-	// Проверяем аргументы командной строки для обратной совместимости
+	// Проверяем аргументы командной строки для экспорта и справки
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "-help", "--help", "help":
@@ -2685,15 +2288,11 @@ func main() {
 		}
 	}
 
-	// Основной интерактивный режим
-	for {
-		if err := showMainMenu(); err != nil {
-			color.New(color.FgRed).Printf("❌ Ошибка: %v\n", err)
-			color.New(color.FgWhite).Print("Нажмите Enter для продолжения...")
-			fmt.Scanln()
-			continue
-		}
-		break
+	// Запуск интерфейса Bubble Tea
+	app := NewApp()
+	p := tea.NewProgram(app, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		log.Fatalf("❌ Ошибка запуска приложения: %v", err)
 	}
 }
 
@@ -2834,19 +2433,16 @@ func runMonitoringMode() error {
 		// Небольшая задержка для первого измерения
 		time.Sleep(2 * time.Second)
 
-		// Показываем дашборд
-		if err := showDashboard(db, ctx); err != nil {
-			log.Printf("дашборд: %v", err)
-		}
-
+		// Возвращаемся в меню для работы с Bubble Tea
+		color.New(color.FgBlue).Println("🔋 Данные собираются в фоне. Используйте главное меню для мониторинга.")
+		
 		cancel()
 		wg.Wait()
+		return nil
 	} else {
 		color.New(color.FgGreen).Println("🔌 Работа от сети - показ сохраненных данных...")
 		return runReportMode()
 	}
-
-	return nil
 }
 
 // runReportMode показывает детальный отчет
@@ -2944,46 +2540,52 @@ func handleExport(format string) error {
 	return err
 }
 
-// runSettingsMenu показывает меню настроек и статистики
+// runSettingsMenu показывает меню очистки БД
 func runSettingsMenu() error {
-	for {
-		fmt.Print("\033[2J\033[H") // Очистка экрана
+	fmt.Print("\033[2J\033[H") // Очистка экрана
 
-		color.New(color.FgCyan, color.Bold).Println("⚙️ Статистика и настройки")
-		color.New(color.FgWhite).Println("═══════════════════════════════")
-		fmt.Println()
-
-		// Показываем статистику БД
-		if err := showDatabaseStats(); err != nil {
-			color.New(color.FgRed).Printf("❌ Ошибка получения статистики: %v\n", err)
+	color.New(color.FgRed, color.Bold).Println("🗑️  Очистка базы данных")
+	color.New(color.FgWhite).Println("═══════════════════════════════")
+	fmt.Println()
+	
+	color.New(color.FgYellow, color.Bold).Println("⚠️  ВНИМАНИЕ: Эта операция удалит ВСЕ сохраненные данные!")
+	fmt.Println()
+	fmt.Println("Будут удалены:")
+	fmt.Println("  • Все измерения батареи")
+	fmt.Println("  • История состояний")
+	fmt.Println("  • Статистика использования")
+	fmt.Println()
+	
+	color.New(color.FgWhite).Print("Вы уверены? (y/н): ")
+	
+	var choice string
+	fmt.Scanln(&choice)
+	
+	if choice == "y" || choice == "Y" || choice == "н" || choice == "Н" {
+		// Удаляем файлы базы данных
+		dbFiles := []string{
+			dbFile,                // batmon.sqlite
+			dbFile + "-shm",       // batmon.sqlite-shm
+			dbFile + "-wal",       // batmon.sqlite-wal
 		}
-
-		fmt.Println()
-		fmt.Println("  1️⃣  Показать расширенные метрики")
-		fmt.Println("  2️⃣  Очистить старые данные")
-		fmt.Println("  3️⃣  Информация о системе")
-		fmt.Println("  0️⃣  Назад в главное меню")
-		fmt.Println()
-
-		color.New(color.FgWhite).Print("Ваш выбор (0-3): ")
-
-		var choice string
-		fmt.Scanln(&choice)
-
-		switch choice {
-		case "1":
-			return showAdvancedMetrics()
-		case "2":
-			return cleanupOldData()
-		case "3":
-			return showSystemInfo()
-		case "0", "back":
-			return nil
-		default:
-			color.New(color.FgRed).Println("\n❌ Неверный выбор. Нажмите Enter для продолжения...")
-			fmt.Scanln()
+		
+		for _, file := range dbFiles {
+			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+				// Не возвращаем ошибку, если файл не существует
+				color.New(color.FgYellow).Printf("⚠️  Не удалось удалить %s: %v\n", file, err)
+			}
 		}
+		
+		color.New(color.FgGreen).Println("✅ База данных успешно очищена!")
+		fmt.Println("\nНажмите Enter для продолжения...")
+		fmt.Scanln()
+	} else {
+		color.New(color.FgYellow).Println("❌ Операция отменена")
+		fmt.Println("\nНажмите Enter для продолжения...")
+		fmt.Scanln()
 	}
+	
+	return nil
 }
 
 // showDatabaseStats показывает статистику базы данных
@@ -3126,11 +2728,21 @@ func showHelp() {
 
 	color.New(color.FgYellow).Println("📊 Возможности:")
 	fmt.Println("• Интерактивный дашборд с графиками")
-	fmt.Println("• Анализ трендов и прогноз деградации")
+	fmt.Println("• Анализ трендов и прогноз деградации") 
 	fmt.Println("• Мониторинг температуры и расширенных метрик")
 	fmt.Println("• Экспорт в Markdown и HTML форматы")
 	fmt.Println("• Автоматическая ретенция данных")
 	fmt.Println("• Цветной вывод и эмодзи индикаторы")
+	fmt.Println()
+
+	color.New(color.FgMagenta).Println("🫧 Интерфейс Bubble Tea (по умолчанию):")
+	fmt.Println("Современный интерфейс с:")
+	fmt.Println("• Интерактивными компонентами и анимациями")
+	fmt.Println("• Отличной отзывчивостью и производительностью")
+	fmt.Println("• Адаптивными макетами")
+	fmt.Println("• Красивой стилизацией")
+	fmt.Println()
+	color.New(color.FgCyan).Println("Запуск: ./batmon")
 	fmt.Println()
 
 	color.New(color.FgBlue).Println("🎯 Режимы работы:")
@@ -3215,5 +2827,2029 @@ func runExportMode(markdownFile, htmlFile string, quiet bool) error {
 		}
 	}
 
+	return nil
+}
+
+// Bubble Tea функции
+
+// NewDataService создает новый сервис данных
+func NewDataService(db *sqlx.DB, buffer *MemoryBuffer) *DataService {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	// Используем существующую функцию NewDataCollector для правильной инициализации
+	collector := NewDataCollector(db)
+	// Заменяем буфер на наш
+	collector.buffer = buffer
+	
+	return &DataService{
+		collector: collector,
+		db:        db,
+		buffer:    buffer,
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+}
+
+// Start запускает фоновый сбор данных
+func (ds *DataService) Start() {
+	go ds.collectData()
+}
+
+// Stop останавливает сбор данных
+func (ds *DataService) Stop() {
+	ds.cancel()
+}
+
+// collectData выполняет фоновый сбор данных
+func (ds *DataService) collectData() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ds.ctx.Done():
+			return
+		case <-ticker.C:
+			// Собираем данные асинхронно
+			go func() {
+				if err := ds.collector.CollectAndStore(); err != nil {
+					log.Printf("Ошибка сбора данных: %v", err)
+				}
+			}()
+		}
+	}
+}
+
+// GetLatest возвращает последнее измерение
+func (ds *DataService) GetLatest() *Measurement {
+	return ds.buffer.GetLatest()
+}
+
+// GetLast возвращает последние N измерений
+func (ds *DataService) GetLast(n int) []Measurement {
+	return ds.buffer.GetLast(n)
+}
+
+// Сообщения Bubble Tea
+type tickMsg time.Time
+type dataUpdateMsg struct {
+	measurements []Measurement
+	latest       *Measurement
+}
+
+type errorMsg struct{ err error }
+
+// Команды Bubble Tea
+func tickEvery() tea.Cmd {
+	return tea.Every(time.Second*10, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+func updateData(ds *DataService) tea.Cmd {
+	return func() tea.Msg {
+		latest := ds.GetLatest()
+		measurements := ds.GetLast(50)
+		return dataUpdateMsg{
+			measurements: measurements,
+			latest:       latest,
+		}
+	}
+}
+
+// NewApp создает новое приложение
+func NewApp() *App {
+	// Инициализация базы данных и буфера
+	db, err := initDB(dbFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	
+	buffer := NewMemoryBuffer(100)
+	if err := buffer.LoadFromDB(db, 50); err != nil {
+		log.Printf("Предупреждение: не удалось загрузить данные из БД: %v", err)
+	}
+	
+	// Создание сервиса данных
+	dataService := NewDataService(db, buffer)
+	dataService.Start()
+	
+	// Создание главного меню
+	menuItems := []list.Item{
+		menuItem{title: "🔋 Интерактивный мониторинг", desc: "Мониторинг батареи в реальном времени"},
+		menuItem{title: "📊 Детальный отчет", desc: "Анализ всех сохраненных данных"},
+		menuItem{title: "📄 Экспорт отчетов", desc: "Сохранение в Markdown или HTML"},
+		menuItem{title: "🗑️  Очистить БД", desc: "Удалить все сохраненные данные"},
+		menuItem{title: "❌ Выход", desc: "Завершить работу программы"},
+	}
+	
+	menuList := list.New(menuItems, list.NewDefaultDelegate(), 0, 0)
+	menuList.Title = "🔋 BatMon - Мониторинг батареи MacBook"
+	
+	return &App{
+		state: StateMenu,
+		menu: MenuModel{
+			list: menuList,
+		},
+		dataService: dataService,
+	}
+}
+
+// Init инициализирует модель
+func (a *App) Init() tea.Cmd {
+	return tea.Batch(
+		tickEvery(),
+		updateData(a.dataService),
+	)
+}
+
+// Update обрабатывает сообщения
+func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+	
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		a.windowWidth = msg.Width
+		a.windowHeight = msg.Height
+		a.menu.list.SetSize(msg.Width-2, msg.Height-4)
+		
+	case tea.KeyMsg:
+		switch a.state {
+		case StateMenu:
+			return a.updateMenu(msg)
+		case StateDashboard:
+			return a.updateDashboard(msg)
+		case StateReport:
+			return a.updateReport(msg)
+		case StateExport:
+			return a.updateExport(msg)
+		case StateSettings:
+			return a.updateSettings(msg)
+		}
+		
+	case tickMsg:
+		cmds = append(cmds, tickEvery())
+		if a.state == StateDashboard {
+			cmds = append(cmds, updateData(a.dataService))
+		}
+		
+	case dataUpdateMsg:
+		a.measurements = msg.measurements
+		a.latest = msg.latest
+		if a.state == StateDashboard {
+			a.updateDashboardData()
+		}
+	}
+	
+	return a, tea.Batch(cmds...)
+}
+
+// updateMenu обрабатывает обновления меню
+func (a *App) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й":
+		a.dataService.Stop()
+		return a, tea.Quit
+		
+	case "enter":
+		selected := a.menu.list.SelectedItem()
+		if item, ok := selected.(menuItem); ok {
+			switch item.title {
+			case "🔋 Интерактивный мониторинг":
+				a.state = StateDashboard
+				a.initDashboard()
+			case "📊 Детальный отчет":
+				a.state = StateReport
+				a.initReport()
+			case "📄 Экспорт отчетов":
+				a.state = StateExport
+			case "🗑️  Очистить БД":
+				a.state = StateSettings
+			case "❌ Выход":
+				a.dataService.Stop()
+				return a, tea.Quit
+			}
+		}
+	}
+	
+	var cmd tea.Cmd
+	a.menu.list, cmd = a.menu.list.Update(msg)
+	return a, cmd
+}
+
+// updateDashboard обрабатывает обновления dashboard
+func (a *App) updateDashboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й":
+		a.state = StateMenu
+		return a, nil
+	case "r", "к":
+		return a, updateData(a.dataService)
+	case "h", "р":
+		// Показать краткую справку (можно расширить позже)
+		return a, nil
+	}
+	return a, nil
+}
+
+// updateReport обрабатывает обновления отчета
+func (a *App) updateReport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й":
+		a.state = StateMenu
+		a.reportScrollY = 0 // Сбрасываем скролл при выходе
+		return a, nil
+	case "up":
+		if a.report.activeTab == 3 { // В табе История
+			// Навигация по таблице
+			a.reportScrollY--
+			if a.reportScrollY < 0 {
+				a.reportScrollY = 0
+			}
+		} else {
+			if a.reportScrollY > 0 {
+				a.reportScrollY--
+			}
+		}
+	case "down":
+		if a.report.activeTab == 3 { // В табе История
+			// Навигация по таблице
+			a.reportScrollY++
+		} else {
+			a.reportScrollY++
+		}
+	case "left", "a", "ф":
+		// Переключение на предыдущую вкладку
+		if a.report.activeTab > 0 {
+			a.report.activeTab--
+			a.reportScrollY = 0
+		}
+	case "right", "d", "в":
+		// Переключение на следующую вкладку
+		if a.report.activeTab < len(a.report.tabs)-1 {
+			a.report.activeTab++
+			a.reportScrollY = 0
+		}
+	case "1", "2", "3", "4", "5":
+		// Быстрый переход к вкладке
+		tabNum, _ := strconv.Atoi(msg.String())
+		if tabNum > 0 && tabNum <= len(a.report.tabs) {
+			a.report.activeTab = tabNum - 1
+			a.reportScrollY = 0
+		}
+	case "f":
+		// Переключение фильтра в истории
+		if a.report.activeTab == 3 {
+			switch a.report.filterState {
+			case "all":
+				a.report.filterState = "charging"
+			case "charging":
+				a.report.filterState = "discharging"
+			case "discharging":
+				a.report.filterState = "all"
+			}
+		}
+	case "s":
+		// Переключение сортировки в истории
+		if a.report.activeTab == 3 {
+			a.report.sortDesc = !a.report.sortDesc
+		}
+	case "r", "к":
+		// Обновляем данные отчета
+		a.reportScrollY = 0 // Сбрасываем скролл при обновлении
+		a.report.lastUpdate = time.Now()
+		return a, nil
+	}
+	
+	// Обновляем счетчик анимации
+	a.report.animationTick++
+	
+	return a, nil
+}
+
+// updateExport обрабатывает обновления экспорта
+func (a *App) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й":
+		a.state = StateMenu
+		a.exportStatus = "" // Очищаем статус при выходе
+		return a, nil
+	case "enter":
+		// Генерируем имя файла с текущей датой
+		filename := fmt.Sprintf("report_%s.html", time.Now().Format("2006-01-02"))
+		a.exportStatus = "Экспорт в процессе..."
+		a.exportToHTMLAsync(filename)
+		return a, nil
+	}
+	return a, nil
+}
+
+// exportToHTMLAsync выполняет экспорт в HTML асинхронно
+func (a *App) exportToHTMLAsync(filename string) {
+	go func() {
+		// Создаем временное соединение с базой данных для экспорта
+		db, err := initDB(dbFile)
+		if err != nil {
+			a.exportStatus = "Ошибка подключения к БД"
+			return
+		}
+		defer db.Close()
+		
+		// Генерируем данные для отчета
+		data, err := generateReportData(db)
+		if err != nil {
+			a.exportStatus = "Ошибка генерации данных"
+			return
+		}
+		
+		// Экспортируем в HTML
+		err = exportToHTML(data, filename)
+		if err != nil {
+			a.exportStatus = "Ошибка экспорта"
+			return
+		}
+		
+		a.exportStatus = fmt.Sprintf("Успешно экспортировано в %s", filename)
+	}()
+}
+
+// generateUIReportData генерирует данные для UI отчета
+func (a *App) generateUIReportData() (*ReportData, error) {
+	// Создаем соединение с базой данных как в экспорте
+	db, err := initDB(dbFile)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка подключения к БД: %w", err)
+	}
+	defer db.Close()
+	
+	data, err := generateReportData(db)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка генерации данных: %w", err)
+	}
+	
+	return &data, nil
+}
+
+// updateSettings обрабатывает обновления настроек
+func (a *App) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q", "й", "n", "N", "н", "Н":
+		a.state = StateMenu
+		return a, nil
+	case "y", "Y", "д", "Д":
+		err := a.clearDatabase()
+		if err != nil {
+			a.lastError = fmt.Errorf("ошибка очистки БД: %v", err)
+		} else {
+			a.lastError = nil
+		}
+		a.state = StateMenu
+		return a, nil
+	}
+	return a, nil
+}
+
+// View рендерит интерфейс
+func (a *App) View() string {
+	switch a.state {
+	case StateMenu:
+		return a.renderMenu()
+	case StateDashboard:
+		return a.renderDashboard()
+	case StateReport:
+		return a.renderReport()
+	case StateExport:
+		return a.renderExport()
+	case StateSettings:
+		return a.renderSettings()
+	default:
+		return "Неизвестное состояние приложения"
+	}
+}
+
+// renderMenu рендерит главное меню
+func (a *App) renderMenu() string {
+	return lipgloss.NewStyle().
+		Padding(1).
+		Render(a.menu.list.View())
+}
+
+// renderDashboard рендерит dashboard
+func (a *App) renderDashboard() string {
+	if a.latest == nil {
+		return a.renderLoadingScreen()
+	}
+	
+	// Вычисляем размеры для адаптивной разметки
+	contentWidth := a.windowWidth - 4   // Отступы
+	contentHeight := a.windowHeight - 4 // Отступы
+	
+	if contentWidth < 60 || contentHeight < 20 {
+		return a.renderCompactDashboard()
+	}
+	
+	return a.renderFullDashboard(contentWidth, contentHeight)
+}
+
+// renderLoadingScreen показывает экран загрузки
+func (a *App) renderLoadingScreen() string {
+	loading := "🔄 Загрузка данных батареи...\n\nПодождите, идет сбор информации о состоянии батареи."
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Padding(2).
+		Align(lipgloss.Center).
+		Width(50).
+		Height(10).
+		Render(loading)
+}
+
+// renderCompactDashboard рендерит компактную версию для маленьких экранов
+func (a *App) renderCompactDashboard() string {
+	// Простая визуализация для компактного режима
+	batteryData := make([]float64, 0, len(a.measurements))
+	for _, m := range a.measurements {
+		batteryData = append(batteryData, float64(m.Percentage))
+	}
+	
+	// Создаем простой спарклайн вручную
+	sparklineStr := ""
+	if len(batteryData) > 0 {
+		for _, val := range batteryData[max(0, len(batteryData)-10):] {
+			if val > 75 {
+				sparklineStr += "█"
+			} else if val > 50 {
+				sparklineStr += "▓"
+			} else if val > 25 {
+				sparklineStr += "▒"
+			} else {
+				sparklineStr += "░"
+			}
+		}
+	}
+	
+	content := fmt.Sprintf(`🔋 Мониторинг батареи
+
+Заряд: %d%% │ %s
+Состояние: %s
+Циклы: %d │ Износ: %.1f%%
+Температура: %d°C
+
+⌨️  'q'/'й' - выход │ 'r'/'к' - обновить`,
+		a.latest.Percentage,
+		sparklineStr,
+		a.latest.State,
+		a.latest.CycleCount,
+		computeWear(a.latest.DesignCapacity, a.latest.FullChargeCap),
+		a.latest.Temperature,
+	)
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(getBatteryColor(a.latest.Percentage)).
+		Padding(1).
+		Render(content)
+}
+
+// renderFullDashboard рендерит полную версию dashboard
+func (a *App) renderFullDashboard(width, height int) string {
+	// Размеры для графиков
+	// Данные для простого отображения графиков
+	batteryData := make([]float64, 0, len(a.measurements))
+	capacityData := make([]float64, 0, len(a.measurements))
+	
+	for _, m := range a.measurements {
+		batteryData = append(batteryData, float64(m.Percentage))
+		capacityData = append(capacityData, float64(m.CurrentCapacity))
+	}
+	
+	// Создаем реальные графики
+	chartWidth := width/2 - 2
+	chartHeight := height/2 - 2
+	
+	var batteryChartContent, capacityChartContent string
+	
+	if len(batteryData) > 0 {
+		batteryChart := NewBatteryChart(chartWidth, chartHeight)
+		batteryChart.SetData(batteryData)
+		batteryChartContent = batteryChart.Render()
+	} else {
+		batteryChartContent = "📊 График заряда\n[Нет данных для отображения]"
+	}
+	
+	if len(capacityData) > 0 {
+		capacityChart := NewCapacityChart(chartWidth, chartHeight)  
+		capacityChart.SetData(capacityData)
+		capacityChartContent = capacityChart.Render()
+	} else {
+		capacityChartContent = "📈 График емкости\n[Нет данных для отображения]"
+	}
+	
+	// Информационная панель
+	infoPanel := a.renderInfoPanel(width/2, height/2)
+	
+	// Статистика
+	statsPanel := a.renderStatsPanel(width/2, height/2)
+	
+	// Компоновка: графики сверху, панели снизу
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		batteryChartContent,
+		" ", // Разделитель
+		capacityChartContent,
+	)
+	
+	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top,
+		infoPanel,
+		" ", // Разделитель  
+		statsPanel,
+	)
+	
+	return lipgloss.JoinVertical(lipgloss.Left, topRow, "", bottomRow)
+}
+
+// renderInfoPanel рендерит информационную панель
+func (a *App) renderInfoPanel(width, height int) string {
+	wear := computeWear(a.latest.DesignCapacity, a.latest.FullChargeCap)
+	
+	// Вычисляем проценты для прогресс-баров
+	batteryPercent := float64(a.latest.Percentage) / 100.0
+	wearPercent := wear / 100.0
+	
+	// Рендерим прогресс-бары
+	batteryBar := a.dashboard.batteryGauge.ViewAs(batteryPercent)
+	wearBar := a.dashboard.wearGauge.ViewAs(wearPercent)
+	
+	content := fmt.Sprintf(`🔋 Текущее состояние
+
+⚡ Заряд: %d%%
+%s
+
+📉 Износ: %.1f%%
+%s
+
+🔄 Состояние: %s
+🔁 Циклы: %d
+🌡️  Температура: %d°C
+⚡ Напряжение: %d мВ
+🔌 Ток: %d мА
+
+💚 Здоровье: %s`,
+		a.latest.Percentage,
+		batteryBar,
+		wear,
+		wearBar,
+		formatBatteryState(a.latest.State),
+		a.latest.CycleCount,
+		a.latest.Temperature,
+		a.latest.Voltage,
+		a.latest.Amperage,
+		getBatteryHealthStatus(wear, a.latest.CycleCount),
+	)
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(getBatteryColor(a.latest.Percentage)).
+		Padding(1).
+		Width(width-2).
+		Height(height-2).
+		Render(content)
+}
+
+// renderStatsPanel рендерит панель со статистикой и управлением
+func (a *App) renderStatsPanel(width, height int) string {
+	// Обновляем данные таблицы
+	a.updateMeasureTable()
+	
+	// Рендерим таблицу
+	tableView := a.dashboard.measureTable.View()
+	
+	content := fmt.Sprintf(`Последние измерения
+
+%s
+
+Управление:
+   'q'/'й' - выход в меню
+   'r'/'к' - обновить данные
+   'h'/'р' - показать справку
+
+Поддержка мультиязычных
+горячих клавиш`,
+		tableView,
+	)
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1).
+		Width(width-4).
+		Height(height-2).
+		Render(content)
+}
+
+// updateMeasureTable обновляет данные в таблице измерений
+func (a *App) updateMeasureTable() {
+	rows := make([]table.Row, 0)
+	
+	// Берем последние 5 измерений
+	recentCount := 5
+	if len(a.measurements) < recentCount {
+		recentCount = len(a.measurements)
+	}
+	
+	if recentCount > 0 {
+		start := len(a.measurements) - recentCount
+		for i := start; i < len(a.measurements); i++ {
+			m := a.measurements[i]
+			
+			// Форматируем время
+			timeStr := "?"
+			if len(m.Timestamp) >= 19 {
+				timeStr = m.Timestamp[11:16] // HH:MM
+			}
+			
+			// Форматируем состояние
+			stateStr := m.State
+			if len(stateStr) > 8 {
+				stateStr = stateStr[:8] + "..."
+			}
+			
+			// Форматируем температуру
+			tempStr := "-"
+			if m.Temperature > 0 {
+				tempStr = fmt.Sprintf("%d°C", m.Temperature)
+			}
+			
+			row := table.Row{
+				timeStr,
+				fmt.Sprintf("%d%%", m.Percentage),
+				stateStr,
+				tempStr,
+			}
+			
+			rows = append(rows, row)
+		}
+	}
+	
+	a.dashboard.measureTable.SetRows(rows)
+}
+
+// Вспомогательные функции для стилизации
+func getBatteryColor(percentage int) lipgloss.Color {
+	switch {
+	case percentage >= 50:
+		return lipgloss.Color("46") // Зеленый
+	case percentage >= 20:
+		return lipgloss.Color("226") // Желтый
+	default:
+		return lipgloss.Color("196") // Красный
+	}
+}
+
+func formatBatteryState(state string) string {
+	switch state {
+	case "charging":
+		return "🔌 Зарядка"
+	case "discharging":
+		return "🔋 Разрядка"
+	case "charged":
+		return "✅ Заряжена"
+	default:
+		return state
+	}
+}
+
+func getBatteryHealthStatus(wear float64, cycles int) string {
+	switch {
+	case wear < 5 && cycles < 300:
+		return "Отличное"
+	case wear < 10 && cycles < 500:
+		return "Хорошее"  
+	case wear < 20 && cycles < 800:
+		return "Удовлетворительное"
+	default:
+		return "Требует внимания"
+	}
+}
+
+// renderReport рендерит детальный отчет с полной аналитикой
+func (a *App) renderReport() string {
+	// Получаем полные данные аналитики
+	reportData, err := a.generateUIReportData()
+	if err != nil {
+		return fmt.Sprintf("❌ Ошибка загрузки отчета: %v\nНажмите 'q' для выхода в меню", err)
+	}
+
+	// Создаем контент в зависимости от активной вкладки
+	var tabContent string
+	switch a.report.activeTab {
+	case 0: // Обзор
+		tabContent = a.renderReportOverview(reportData)
+	case 1: // Графики
+		tabContent = a.renderReportCharts(reportData)
+	case 2: // Аномалии
+		tabContent = a.renderReportAnomalies(reportData)
+	case 3: // История
+		tabContent = a.renderReportHistory(reportData)
+	case 4: // Прогнозы
+		tabContent = a.renderReportPredictions(reportData)
+	default:
+		tabContent = a.renderReportOverview(reportData)
+	}
+	
+	// Рендерим табы
+	tabBar := a.renderTabBar()
+	
+	// Создаем финальный контент
+	var content strings.Builder
+	content.WriteString(tabBar)
+	content.WriteString("\n")
+	content.WriteString(tabContent)
+	
+	// Добавляем панель управления
+	helpBar := a.renderReportHelpBar()
+	content.WriteString("\n")
+	content.WriteString(helpBar)
+	
+	// Оборачиваем в стильную рамку
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(a.getTabColor()).
+		Padding(1).
+		Width(a.windowWidth-4).
+		Render(content.String())
+}
+
+// buildReportContent создает содержимое отчета на основе данных аналитики
+func (a *App) buildReportContent(data *ReportData) string {
+	var content strings.Builder
+	
+	// Заголовок
+	content.WriteString("📊 Детальный отчет о состоянии батареи\n")
+	content.WriteString(strings.Repeat("═", 50) + "\n\n")
+	
+	// 1. Заголовочная панель с ключевыми метриками
+	content.WriteString("🔋 ОБЩЕЕ СОСТОЯНИЕ\n")
+	content.WriteString("┌─────────────────────────────────────────────────┐\n")
+	
+	healthStatus := getBatteryHealthStatus(data.Wear, data.Latest.CycleCount)
+	healthEmoji := getHealthEmoji(data.Wear)
+	content.WriteString(fmt.Sprintf("│ Состояние: %s %s\n", healthEmoji, healthStatus))
+	
+	// Рейтинг здоровья с прогресс-баром
+	if healthAnalysis, ok := data.HealthAnalysis["health_score"].(float64); ok {
+		healthScore := int(healthAnalysis)
+		progressBar := createProgressBar(healthScore, 100, 20)
+		content.WriteString(fmt.Sprintf("│ Рейтинг:   %s %d/100\n", progressBar, healthScore))
+	}
+	
+	content.WriteString(fmt.Sprintf("│ Износ:     %.1f%%\n", data.Wear))
+	content.WriteString(fmt.Sprintf("│ Циклы:     %d\n", data.Latest.CycleCount))
+	content.WriteString("└─────────────────────────────────────────────────┘\n\n")
+	
+	// 2. Текущее состояние
+	content.WriteString("⚡ ТЕКУЩЕЕ СОСТОЯНИЕ\n")
+	content.WriteString("┌─────────────────────────────────────────────────┐\n")
+	
+	// Заряд с прогресс-баром
+	chargeBar := createProgressBar(data.Latest.Percentage, 100, 25)
+	content.WriteString(fmt.Sprintf("│ Заряд:     %s %d%%\n", chargeBar, data.Latest.Percentage))
+	
+	stateEmoji := getStateEmoji(data.Latest.State)
+	content.WriteString(fmt.Sprintf("│ Статус:    %s %s\n", stateEmoji, formatBatteryState(data.Latest.State)))
+	
+	// Прогнозируемое время
+	if data.RemainingTime > 0 {
+		content.WriteString(fmt.Sprintf("│ Осталось:  %s\n", formatDuration(data.RemainingTime)))
+	}
+	
+	tempEmoji := getTempEmoji(data.Latest.Temperature)
+	content.WriteString(fmt.Sprintf("│ Темп-ра:   %s %d°C\n", tempEmoji, data.Latest.Temperature))
+	content.WriteString("└─────────────────────────────────────────────────┘\n\n")
+	
+	// 3. Анализ производительности
+	content.WriteString("📈 АНАЛИЗ ПРОИЗВОДИТЕЛЬНОСТИ\n")
+	content.WriteString("┌─────────────────────────────────────────────────┐\n")
+	content.WriteString(fmt.Sprintf("│ Скорость разряда:   %.1f мА/ч\n", data.RobustRate))
+	if data.Latest.Power != 0 {
+		content.WriteString(fmt.Sprintf("│ Потребление:        %d мВт\n", abs(data.Latest.Power)))
+	}
+	if data.Latest.Voltage != 0 {
+		content.WriteString(fmt.Sprintf("│ Напряжение:         %.2f В\n", float64(data.Latest.Voltage)/1000))
+	}
+	content.WriteString(fmt.Sprintf("│ Валидных интервалов: %d\n", data.ValidIntervals))
+	content.WriteString("└─────────────────────────────────────────────────┘\n\n")
+	
+	// 4. Здоровье батареи
+	content.WriteString("💊 ЗДОРОВЬЕ БАТАРЕИ\n")
+	content.WriteString("┌─────────────────────────────────────────────────┐\n")
+	content.WriteString(fmt.Sprintf("│ Текущая емкость:    %d мАч\n", data.Latest.CurrentCapacity))
+	content.WriteString(fmt.Sprintf("│ Полная емкость:     %d мАч\n", data.Latest.FullChargeCap))
+	content.WriteString(fmt.Sprintf("│ Проектная емкость:  %d мАч\n", data.Latest.DesignCapacity))
+	
+	if data.Latest.AppleCondition != "" {
+		content.WriteString(fmt.Sprintf("│ Статус Apple:       %s\n", data.Latest.AppleCondition))
+	}
+	
+	content.WriteString("└─────────────────────────────────────────────────┘\n\n")
+	
+	// 5. Обнаруженные проблемы и рекомендации
+	if len(data.Anomalies) > 0 {
+		content.WriteString("⚠️  ОБНАРУЖЕННЫЕ ПРОБЛЕМЫ\n")
+		content.WriteString("┌─────────────────────────────────────────────────┐\n")
+		for _, anomaly := range data.Anomalies {
+			content.WriteString(fmt.Sprintf("│ • %s\n", anomaly))
+		}
+		content.WriteString("└─────────────────────────────────────────────────┘\n\n")
+	}
+	
+	if len(data.Recommendations) > 0 {
+		content.WriteString("💡 РЕКОМЕНДАЦИИ\n")
+		content.WriteString("┌─────────────────────────────────────────────────┐\n")
+		for _, rec := range data.Recommendations {
+			content.WriteString(fmt.Sprintf("│ • %s\n", rec))
+		}
+		content.WriteString("└─────────────────────────────────────────────────┘\n\n")
+	}
+	
+	// 6. История измерений (компактная)
+	content.WriteString("📋 ПОСЛЕДНИЕ ИЗМЕРЕНИЯ\n")
+	content.WriteString("┌──────────┬─────────┬─────────────────┬──────────┐\n")
+	content.WriteString("│   Время  │ Заряд % │    Состояние    │ Темп °C  │\n")
+	content.WriteString("├──────────┼─────────┼─────────────────┼──────────┤\n")
+	
+	recentCount := 10
+	if len(data.Measurements) < recentCount {
+		recentCount = len(data.Measurements)
+	}
+	
+	for i := len(data.Measurements) - recentCount; i < len(data.Measurements); i++ {
+		m := data.Measurements[i]
+		timeStr := m.Timestamp[11:19] // HH:MM:SS
+		stateStr := formatBatteryStateShort(m.State)
+		content.WriteString(fmt.Sprintf("│ %8s │   %3d   │ %-15s │    %2d    │\n", 
+			timeStr, m.Percentage, stateStr, m.Temperature))
+	}
+	content.WriteString("└──────────┴─────────┴─────────────────┴──────────┘\n")
+	
+	return content.String()
+}
+
+// Вспомогательные функции для отображения отчета
+
+// getHealthEmoji возвращает эмодзи для состояния здоровья батареи
+func getHealthEmoji(wear float64) string {
+	switch {
+	case wear < 5:
+		return "💚"
+	case wear < 10:
+		return "🟢"
+	case wear < 20:
+		return "🟡"
+	case wear < 30:
+		return "🟠"
+	default:
+		return "🔴"
+	}
+}
+
+// getStateEmoji возвращает эмодзи для состояния батареи
+func getStateEmoji(state string) string {
+	switch state {
+	case "charging":
+		return "🔌"
+	case "discharging":
+		return "🔋"
+	case "charged":
+		return "✅"
+	case "AC":
+		return "⚡"
+	default:
+		return "❓"
+	}
+}
+
+// getTempEmoji возвращает эмодзи для температуры
+func getTempEmoji(temp int) string {
+	switch {
+	case temp < 15:
+		return "🧊"
+	case temp < 25:
+		return "❄️"
+	case temp < 35:
+		return "🌡️"
+	case temp < 45:
+		return "🔥"
+	default:
+		return "🌋"
+	}
+}
+
+// createProgressBar создает ASCII прогресс-бар
+func createProgressBar(current, max, width int) string {
+	if max == 0 {
+		return strings.Repeat("░", width)
+	}
+	
+	filled := (current * width) / max
+	if filled > width {
+		filled = width
+	}
+	
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return fmt.Sprintf("[%s]", bar)
+}
+
+// formatBatteryStateShort возвращает короткое описание состояния батареи
+func formatBatteryStateShort(state string) string {
+	switch state {
+	case "charging":
+		return "Зарядка"
+	case "discharging":
+		return "Разрядка"
+	case "charged":
+		return "Заряжена"
+	case "AC":
+		return "От сети"
+	default:
+		return state
+	}
+}
+
+// formatDuration форматирует время в читаемый вид
+func formatDuration(d time.Duration) string {
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	
+	if hours > 0 {
+		return fmt.Sprintf("%d ч %d мин", hours, minutes)
+	}
+	return fmt.Sprintf("%d мин", minutes)
+}
+
+// renderTabBar рендерит панель вкладок
+func (a *App) renderTabBar() string {
+	var tabs []string
+	for i, tab := range a.report.tabs {
+		style := lipgloss.NewStyle().
+			Padding(0, 1)
+		
+		if i == a.report.activeTab {
+			// Активная вкладка
+			style = style.
+				Background(lipgloss.Color("62")).
+				Foreground(lipgloss.Color("230")).
+				Bold(true)
+		} else {
+			// Неактивная вкладка
+			style = style.
+				Foreground(lipgloss.Color("241"))
+		}
+		
+		tabText := fmt.Sprintf("[%d] %s", i+1, tab)
+		tabs = append(tabs, style.Render(tabText))
+	}
+	
+	return lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
+}
+
+// getTabColor возвращает цвет для активной вкладки
+func (a *App) getTabColor() lipgloss.Color {
+	colors := []lipgloss.Color{
+		lipgloss.Color("62"),  // Обзор - синий
+		lipgloss.Color("214"), // Графики - оранжевый
+		lipgloss.Color("196"), // Аномалии - красный
+		lipgloss.Color("82"),  // История - зеленый
+		lipgloss.Color("99"),  // Прогнозы - фиолетовый
+	}
+	
+	if a.report.activeTab < len(colors) {
+		return colors[a.report.activeTab]
+	}
+	return lipgloss.Color("240")
+}
+
+// renderReportHelpBar рендерит панель помощи
+func (a *App) renderReportHelpBar() string {
+	helpStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241")).
+		Padding(0, 1)
+	
+	help := []string{
+		"← → Табы",
+		"1-5 Быстрый переход",
+		"↑↓ Скролл",
+		"r Обновить",
+		"q Выход",
+	}
+	
+	if a.report.activeTab == 3 { // История
+		help = append([]string{"f Фильтр", "s Сортировка"}, help...)
+	}
+	
+	return helpStyle.Render(strings.Join(help, " • "))
+}
+
+// renderReportOverview рендерит вкладку обзора с виджетами
+func (a *App) renderReportOverview(data *ReportData) string {
+	// Создаем виджеты для обзора
+	widgets := a.createOverviewWidgets(data)
+	
+	// Определяем раскладку в зависимости от размера экрана
+	if a.windowWidth < 100 {
+		// Вертикальная раскладка для узких экранов
+		return a.renderWidgetsVertical(widgets)
+	}
+	
+	// Сетка 2x2 или 3x2 для широких экранов
+	return a.renderWidgetsGrid(widgets)
+}
+
+// createOverviewWidgets создает виджеты для обзора
+func (a *App) createOverviewWidgets(data *ReportData) []ReportWidget {
+	widgets := []ReportWidget{}
+	
+	// Виджет здоровья батареи
+	healthScore := 70.0
+	if score, ok := data.HealthAnalysis["health_score"].(float64); ok {
+		healthScore = score
+	}
+	
+	widgets = append(widgets, ReportWidget{
+		title:      "💚 Здоровье батареи",
+		widgetType: "gauge",
+		value:      healthScore,
+		maxValue:   100,
+		color:      a.getHealthColor(healthScore),
+		icon:       a.getHealthIcon(healthScore),
+	})
+	
+	// Виджет текущего заряда
+	widgets = append(widgets, ReportWidget{
+		title:      "🔋 Текущий заряд",
+		widgetType: "gauge",
+		value:      float64(data.Latest.Percentage),
+		maxValue:   100,
+		color:      getBatteryColor(data.Latest.Percentage),
+		icon:       "⚡",
+	})
+	
+	// Виджет износа
+	widgets = append(widgets, ReportWidget{
+		title:      "⚙️ Износ батареи",
+		widgetType: "gauge",
+		value:      data.Wear,
+		maxValue:   30, // Максимально допустимый износ
+		color:      a.getWearColor(data.Wear),
+		icon:       "📉",
+	})
+	
+	// Виджет циклов
+	cyclePercent := float64(data.Latest.CycleCount) / 1000.0 * 100
+	widgets = append(widgets, ReportWidget{
+		title:      "🔄 Циклы зарядки",
+		widgetType: "info",
+		content:    fmt.Sprintf("%d / 1000", data.Latest.CycleCount),
+		value:      cyclePercent,
+		maxValue:   100,
+		color:      a.getCycleColor(data.Latest.CycleCount),
+		icon:       "♻️",
+	})
+	
+	// Виджет времени работы
+	if data.RemainingTime > 0 {
+		widgets = append(widgets, ReportWidget{
+			title:      "⏱️ Осталось времени",
+			widgetType: "info",
+			content:    formatDuration(data.RemainingTime),
+			color:      lipgloss.Color("82"),
+			icon:       "⏰",
+		})
+	}
+	
+	// Виджет температуры
+	widgets = append(widgets, ReportWidget{
+		title:      "🌡️ Температура",
+		widgetType: "info",
+		content:    fmt.Sprintf("%d°C", data.Latest.Temperature),
+		color:      a.getTempColor(data.Latest.Temperature),
+		icon:       getTempEmoji(data.Latest.Temperature),
+	})
+	
+	return widgets
+}
+
+// renderWidgetsGrid рендерит виджеты в сетке
+func (a *App) renderWidgetsGrid(widgets []ReportWidget) string {
+	var rows []string
+	widgetWidth := (a.windowWidth - 10) / 2 // Два виджета в ряд
+	
+	for i := 0; i < len(widgets); i += 2 {
+		var row []string
+		
+		// Первый виджет в ряду
+		row = append(row, a.renderWidget(widgets[i], widgetWidth))
+		
+		// Второй виджет в ряду (если есть)
+		if i+1 < len(widgets) {
+			row = append(row, a.renderWidget(widgets[i+1], widgetWidth))
+		}
+		
+		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, row...))
+	}
+	
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+// renderWidgetsVertical рендерит виджеты вертикально
+func (a *App) renderWidgetsVertical(widgets []ReportWidget) string {
+	var rows []string
+	widgetWidth := a.windowWidth - 10
+	
+	for _, widget := range widgets {
+		rows = append(rows, a.renderWidget(widget, widgetWidth))
+	}
+	
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+// renderWidget рендерит отдельный виджет
+func (a *App) renderWidget(widget ReportWidget, width int) string {
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(widget.color).
+		Width(width).
+		Padding(1).
+		Margin(0, 1, 1, 0)
+	
+	var content strings.Builder
+	
+	// Заголовок с иконкой
+	titleStyle := lipgloss.NewStyle().
+		Foreground(widget.color).
+		Bold(true)
+	content.WriteString(titleStyle.Render(widget.title))
+	content.WriteString("\n")
+	
+	switch widget.widgetType {
+	case "gauge":
+		// Рендерим прогресс-бар с анимацией
+		bar := a.renderAnimatedProgressBar(widget.value, widget.maxValue, width-6)
+		content.WriteString(bar)
+		content.WriteString("\n")
+		content.WriteString(fmt.Sprintf("%.1f / %.0f", widget.value, widget.maxValue))
+		
+	case "chart":
+		// Мини-график (будет реализован позже)
+		content.WriteString(widget.content)
+		
+	case "info":
+		// Информационный виджет
+		infoStyle := lipgloss.NewStyle().
+			Foreground(widget.color).
+			Align(lipgloss.Center)
+		content.WriteString(infoStyle.Render(widget.content))
+		
+	case "alert":
+		// Предупреждение
+		alertStyle := lipgloss.NewStyle().
+			Foreground(widget.color).
+			Background(lipgloss.Color("52")).
+			Padding(0, 1)
+		content.WriteString(alertStyle.Render(widget.content))
+	}
+	
+	return style.Render(content.String())
+}
+
+// renderAnimatedProgressBar рендерит анимированный прогресс-бар
+func (a *App) renderAnimatedProgressBar(value, maxValue float64, width int) string {
+	if maxValue == 0 {
+		return strings.Repeat("░", width)
+	}
+	
+	percentage := value / maxValue
+	if percentage > 1 {
+		percentage = 1
+	}
+	
+	filled := int(percentage * float64(width))
+	
+	// Добавляем анимацию для заполнения
+	animChar := "█"
+	if a.report.animationTick%4 < 2 && filled < width {
+		animChar = "▓"
+	}
+	
+	bar := strings.Repeat("█", filled)
+	if filled < width {
+		bar += animChar
+		bar += strings.Repeat("░", width-filled-1)
+	}
+	
+	// Добавляем цветовую градацию
+	barStyle := lipgloss.NewStyle()
+	if percentage > 0.7 {
+		barStyle = barStyle.Foreground(lipgloss.Color("82"))
+	} else if percentage > 0.4 {
+		barStyle = barStyle.Foreground(lipgloss.Color("226"))
+	} else {
+		barStyle = barStyle.Foreground(lipgloss.Color("196"))
+	}
+	
+	return fmt.Sprintf("[%s]", barStyle.Render(bar))
+}
+
+// Вспомогательные функции для определения цветов
+func (a *App) getHealthColor(score float64) lipgloss.Color {
+	if score >= 80 {
+		return lipgloss.Color("82")
+	} else if score >= 60 {
+		return lipgloss.Color("226")
+	} else if score >= 40 {
+		return lipgloss.Color("214")
+	}
+	return lipgloss.Color("196")
+}
+
+func (a *App) getHealthIcon(score float64) string {
+	if score >= 80 {
+		return "💚"
+	} else if score >= 60 {
+		return "💛"
+	} else if score >= 40 {
+		return "🧡"
+	}
+	return "❤️"
+}
+
+func (a *App) getWearColor(wear float64) lipgloss.Color {
+	if wear < 10 {
+		return lipgloss.Color("82")
+	} else if wear < 20 {
+		return lipgloss.Color("226")
+	}
+	return lipgloss.Color("196")
+}
+
+func (a *App) getCycleColor(cycles int) lipgloss.Color {
+	if cycles < 300 {
+		return lipgloss.Color("82")
+	} else if cycles < 600 {
+		return lipgloss.Color("226")
+	} else if cycles < 900 {
+		return lipgloss.Color("214")
+	}
+	return lipgloss.Color("196")
+}
+
+func (a *App) getTempColor(temp int) lipgloss.Color {
+	if temp < 30 {
+		return lipgloss.Color("82")
+	} else if temp < 40 {
+		return lipgloss.Color("226")
+	} else if temp < 50 {
+		return lipgloss.Color("214")
+	}
+	return lipgloss.Color("196")
+}
+
+// renderReportCharts рендерит вкладку с графиками
+func (a *App) renderReportCharts(data *ReportData) string {
+	var content strings.Builder
+	
+	content.WriteString("📈 Графики производительности батареи\n")
+	content.WriteString(strings.Repeat("─", 50) + "\n\n")
+	
+	// График заряда за последние измерения
+	content.WriteString("🔋 История заряда (последние 24 часа)\n")
+	content.WriteString(a.renderChargeChart(data.Measurements))
+	content.WriteString("\n\n")
+	
+	// График скорости разряда
+	content.WriteString("⚡ Скорость разряда\n")
+	content.WriteString(a.renderDischargeRateChart(data.Measurements))
+	content.WriteString("\n\n")
+	
+	// График температуры
+	content.WriteString("🌡️ Температурный профиль\n")
+	content.WriteString(a.renderTemperatureChart(data.Measurements))
+	
+	return content.String()
+}
+
+// renderChargeChart рендерит ASCII график заряда
+func (a *App) renderChargeChart(measurements []Measurement) string {
+	if len(measurements) == 0 {
+		return "Нет данных для отображения"
+	}
+	
+	// Берем последние 20 измерений для графика
+	chartData := measurements
+	if len(chartData) > 20 {
+		chartData = chartData[len(chartData)-20:]
+	}
+	
+	height := 10
+	width := 50
+	chart := make([][]string, height)
+	for i := range chart {
+		chart[i] = make([]string, width)
+		for j := range chart[i] {
+			chart[i][j] = " "
+		}
+	}
+	
+	// Находим min и max для масштабирования
+	minVal, maxVal := 100, 0
+	for _, m := range chartData {
+		if m.Percentage < minVal {
+			minVal = m.Percentage
+		}
+		if m.Percentage > maxVal {
+			maxVal = m.Percentage
+		}
+	}
+	
+	// Добавляем отступ для лучшей визуализации
+	if maxVal-minVal < 10 {
+		minVal = max(0, minVal-5)
+		maxVal = min(100, maxVal+5)
+	}
+	
+	// Рисуем точки данных
+	step := float64(width) / float64(len(chartData))
+	for i, m := range chartData {
+		x := int(float64(i) * step)
+		if x >= width {
+			x = width - 1
+		}
+		
+		y := height - 1 - int(float64(m.Percentage-minVal)/float64(maxVal-minVal)*float64(height-1))
+		if y < 0 {
+			y = 0
+		}
+		if y >= height {
+			y = height - 1
+		}
+		
+		// Используем разные символы для визуализации
+		if m.State == "charging" {
+			chart[y][x] = "↑"
+		} else if m.State == "discharging" {
+			chart[y][x] = "↓"
+		} else {
+			chart[y][x] = "●"
+		}
+		
+		// Соединяем точки линией
+		if i > 0 {
+			prevX := int(float64(i-1) * step)
+			prevY := height - 1 - int(float64(chartData[i-1].Percentage-minVal)/float64(maxVal-minVal)*float64(height-1))
+			
+			// Простая линейная интерполяция
+			if prevY != y {
+				for j := 1; j < abs(y-prevY); j++ {
+					midY := prevY
+					if y > prevY {
+						midY = prevY + j
+					} else {
+						midY = prevY - j
+					}
+					if midY >= 0 && midY < height {
+						midX := prevX + (x-prevX)*j/abs(y-prevY)
+						if midX >= 0 && midX < width && chart[midY][midX] == " " {
+							chart[midY][midX] = "·"
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Добавляем оси
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("%3d%% ┤", maxVal))
+	for _, cell := range chart[0] {
+		result.WriteString(cell)
+	}
+	result.WriteString("\n")
+	
+	for i := 1; i < height-1; i++ {
+		result.WriteString("     │")
+		for _, cell := range chart[i] {
+			result.WriteString(cell)
+		}
+		result.WriteString("\n")
+	}
+	
+	result.WriteString(fmt.Sprintf("%3d%% └", minVal))
+	result.WriteString(strings.Repeat("─", width))
+	result.WriteString("\n")
+	result.WriteString("      ")
+	result.WriteString(fmt.Sprintf("%-24s", chartData[0].Timestamp[11:16]))
+	result.WriteString(fmt.Sprintf("%24s", chartData[len(chartData)-1].Timestamp[11:16]))
+	
+	return result.String()
+}
+
+// renderDischargeRateChart рендерит график скорости разряда
+func (a *App) renderDischargeRateChart(measurements []Measurement) string {
+	// Упрощенная версия sparkline графика
+	if len(measurements) < 2 {
+		return "Недостаточно данных"
+	}
+	
+	sparkline := "▁▂▃▄▅▆▇█"
+	var rates []float64
+	
+	for i := 1; i < len(measurements) && i < 20; i++ {
+		if measurements[i].State == "discharging" && measurements[i-1].State == "discharging" {
+			timeDiff := time.Since(time.Now()).Hours() // Заглушка, нужно парсить timestamp
+			if timeDiff > 0 {
+				rate := float64(measurements[i-1].Percentage-measurements[i].Percentage) / timeDiff
+				rates = append(rates, rate)
+			}
+		}
+	}
+	
+	if len(rates) == 0 {
+		return "Нет данных о разряде"
+	}
+	
+	// Находим min и max
+	minRate, maxRate := rates[0], rates[0]
+	for _, r := range rates {
+		if r < minRate {
+			minRate = r
+		}
+		if r > maxRate {
+			maxRate = r
+		}
+	}
+	
+	var result strings.Builder
+	for _, rate := range rates {
+		idx := int((rate - minRate) / (maxRate - minRate) * float64(len(sparkline)-1))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(sparkline) {
+			idx = len(sparkline) - 1
+		}
+		result.WriteString(string(sparkline[idx]))
+	}
+	
+	result.WriteString(fmt.Sprintf("\nМин: %.1f%%/ч  Макс: %.1f%%/ч", minRate, maxRate))
+	
+	return result.String()
+}
+
+// renderTemperatureChart рендерит тепловую карту температуры
+func (a *App) renderTemperatureChart(measurements []Measurement) string {
+	if len(measurements) == 0 {
+		return "Нет данных"
+	}
+	
+	// Берем последние измерения
+	data := measurements
+	if len(data) > 30 {
+		data = data[len(data)-30:]
+	}
+	
+	var result strings.Builder
+	
+	// Создаем тепловую карту с цветами
+	for _, m := range data {
+		tempChar := "█"
+		style := lipgloss.NewStyle()
+		
+		if m.Temperature < 25 {
+			style = style.Foreground(lipgloss.Color("51")) // Холодный - голубой
+		} else if m.Temperature < 35 {
+			style = style.Foreground(lipgloss.Color("82")) // Нормальный - зеленый
+		} else if m.Temperature < 45 {
+			style = style.Foreground(lipgloss.Color("226")) // Теплый - желтый
+		} else {
+			style = style.Foreground(lipgloss.Color("196")) // Горячий - красный
+		}
+		
+		result.WriteString(style.Render(tempChar))
+	}
+	
+	result.WriteString("\n")
+	result.WriteString(fmt.Sprintf("← %s", data[0].Timestamp[11:16]))
+	result.WriteString(fmt.Sprintf(" → %s", data[len(data)-1].Timestamp[11:16]))
+	result.WriteString("\n")
+	result.WriteString("🧊 <25°C  ❄️ 25-35°C  🔥 35-45°C  🌋 >45°C")
+	
+	return result.String()
+}
+
+// renderReportAnomalies рендерит вкладку с аномалиями
+func (a *App) renderReportAnomalies(data *ReportData) string {
+	var content strings.Builder
+	
+	content.WriteString("⚠️ Анализ аномалий и проблем\n")
+	content.WriteString(strings.Repeat("─", 50) + "\n\n")
+	
+	if len(data.Anomalies) == 0 {
+		successStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("82")).
+			Bold(true)
+		content.WriteString(successStyle.Render("✅ Аномалий не обнаружено!\n\n"))
+		content.WriteString("Батарея работает в штатном режиме.\n")
+	} else {
+		// Группируем аномалии по критичности
+		critical := []string{}
+		warning := []string{}
+		info := []string{}
+		
+		for _, anomaly := range data.Anomalies {
+			if strings.Contains(anomaly, "критич") || strings.Contains(anomaly, "опасн") {
+				critical = append(critical, anomaly)
+			} else if strings.Contains(anomaly, "вниман") || strings.Contains(anomaly, "высок") {
+				warning = append(warning, anomaly)
+			} else {
+				info = append(info, anomaly)
+			}
+		}
+		
+		// Критические проблемы
+		if len(critical) > 0 {
+			criticalStyle := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("196")).
+				Bold(true)
+			content.WriteString(criticalStyle.Render("🚨 Критические проблемы:\n"))
+			for _, item := range critical {
+				content.WriteString(fmt.Sprintf("  • %s\n", item))
+			}
+			content.WriteString("\n")
+		}
+		
+		// Предупреждения
+		if len(warning) > 0 {
+			warningStyle := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("214")).
+				Bold(true)
+			content.WriteString(warningStyle.Render("⚡ Требуют внимания:\n"))
+			for _, item := range warning {
+				content.WriteString(fmt.Sprintf("  • %s\n", item))
+			}
+			content.WriteString("\n")
+		}
+		
+		// Информационные
+		if len(info) > 0 {
+			infoStyle := lipgloss.NewStyle().
+				Foreground(lipgloss.Color("226"))
+			content.WriteString(infoStyle.Render("ℹ️ Информация:\n"))
+			for _, item := range info {
+				content.WriteString(fmt.Sprintf("  • %s\n", item))
+			}
+			content.WriteString("\n")
+		}
+	}
+	
+	// Рекомендации
+	if len(data.Recommendations) > 0 {
+		content.WriteString("\n💡 Рекомендации по улучшению:\n")
+		content.WriteString(strings.Repeat("─", 40) + "\n")
+		
+		for i, rec := range data.Recommendations {
+			content.WriteString(fmt.Sprintf("%d. %s\n", i+1, rec))
+		}
+	}
+	
+	// Добавляем инсайты на основе данных
+	content.WriteString("\n\n📊 Статистика аномалий:\n")
+	content.WriteString(fmt.Sprintf("• Обнаружено проблем: %d\n", len(data.Anomalies)))
+	content.WriteString(fmt.Sprintf("• Рекомендаций: %d\n", len(data.Recommendations)))
+	content.WriteString(fmt.Sprintf("• Валидных интервалов: %d\n", data.ValidIntervals))
+	
+	return content.String()
+}
+
+// renderReportHistory рендерит вкладку с историей
+func (a *App) renderReportHistory(data *ReportData) string {
+	var content strings.Builder
+	
+	content.WriteString("📜 История измерений\n")
+	content.WriteString(strings.Repeat("─", 50) + "\n")
+	
+	// Показываем текущий фильтр
+	filterStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("226")).
+		Bold(true)
+	content.WriteString(filterStyle.Render(fmt.Sprintf("Фильтр: %s | Сортировка: %s\n", 
+		a.getFilterLabel(), a.getSortLabel())))
+	content.WriteString("\n")
+	
+	// Фильтруем данные
+	filtered := a.filterMeasurements(data.Measurements)
+	
+	// Сортируем данные
+	sorted := a.sortMeasurements(filtered)
+	
+	// Обновляем таблицу
+	a.updateHistoryTable(sorted)
+	
+	// Рендерим таблицу
+	content.WriteString(a.report.historyTable.View())
+	
+	// Статистика
+	content.WriteString("\n")
+	statsStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241"))
+	content.WriteString(statsStyle.Render(fmt.Sprintf(
+		"Показано: %d из %d записей", 
+		len(filtered), 
+		len(data.Measurements),
+	)))
+	
+	return content.String()
+}
+
+// filterMeasurements фильтрует измерения по состоянию
+func (a *App) filterMeasurements(measurements []Measurement) []Measurement {
+	if a.report.filterState == "all" {
+		return measurements
+	}
+	
+	var filtered []Measurement
+	for _, m := range measurements {
+		if m.State == a.report.filterState {
+			filtered = append(filtered, m)
+		}
+	}
+	
+	return filtered
+}
+
+// sortMeasurements сортирует измерения
+func (a *App) sortMeasurements(measurements []Measurement) []Measurement {
+	// Создаем копию для сортировки
+	sorted := make([]Measurement, len(measurements))
+	copy(sorted, measurements)
+	
+	// Простая сортировка по времени
+	if !a.report.sortDesc {
+		// Обратный порядок (старые первые)
+		for i := 0; i < len(sorted)/2; i++ {
+			sorted[i], sorted[len(sorted)-1-i] = sorted[len(sorted)-1-i], sorted[i]
+		}
+	}
+	
+	return sorted
+}
+
+// updateHistoryTable обновляет данные в таблице истории
+func (a *App) updateHistoryTable(measurements []Measurement) {
+	var rows []table.Row
+	
+	count := 20 // Показываем последние 20 записей
+	if len(measurements) < count {
+		count = len(measurements)
+	}
+	
+	for i := 0; i < count; i++ {
+		m := measurements[i]
+		
+		// Форматируем данные для таблицы
+		timeStr := m.Timestamp[11:19] // HH:MM:SS
+		chargeStr := fmt.Sprintf("%d%%", m.Percentage)
+		stateStr := formatBatteryStateShort(m.State)
+		tempStr := fmt.Sprintf("%d°C", m.Temperature)
+		
+		// Вычисляем скорость разряда
+		rateStr := "-"
+		if i > 0 && measurements[i-1].State == "discharging" && m.State == "discharging" {
+			rate := measurements[i-1].Percentage - m.Percentage
+			if rate > 0 {
+				rateStr = fmt.Sprintf("-%d%%/ч", rate)
+			}
+		}
+		
+		rows = append(rows, table.Row{
+			timeStr,
+			chargeStr,
+			stateStr,
+			tempStr,
+			rateStr,
+		})
+	}
+	
+	a.report.historyTable.SetRows(rows)
+}
+
+// getFilterLabel возвращает метку текущего фильтра
+func (a *App) getFilterLabel() string {
+	switch a.report.filterState {
+	case "all":
+		return "Все"
+	case "charging":
+		return "Зарядка"
+	case "discharging":
+		return "Разрядка"
+	default:
+		return a.report.filterState
+	}
+}
+
+// getSortLabel возвращает метку сортировки
+func (a *App) getSortLabel() string {
+	if a.report.sortDesc {
+		return "Новые первые ↓"
+	}
+	return "Старые первые ↑"
+}
+
+// renderReportPredictions рендерит вкладку с прогнозами
+func (a *App) renderReportPredictions(data *ReportData) string {
+	var content strings.Builder
+	
+	content.WriteString("🔮 Прогнозы и аналитика\n")
+	content.WriteString(strings.Repeat("─", 50) + "\n\n")
+	
+	// Прогноз времени работы
+	if data.RemainingTime > 0 {
+		timeStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("82")).
+			Bold(true)
+		content.WriteString(timeStyle.Render("⏱️ Прогноз времени работы:\n"))
+		content.WriteString(fmt.Sprintf("• При текущей нагрузке: %s\n", formatDuration(data.RemainingTime)))
+		
+		// Дополнительные прогнозы
+		lightUsage := time.Duration(float64(data.RemainingTime) * 1.5)
+		heavyUsage := time.Duration(float64(data.RemainingTime) * 0.6)
+		
+		content.WriteString(fmt.Sprintf("• При легкой нагрузке: %s\n", formatDuration(lightUsage)))
+		content.WriteString(fmt.Sprintf("• При тяжелой нагрузке: %s\n", formatDuration(heavyUsage)))
+		content.WriteString("\n")
+	}
+	
+	// Прогноз деградации
+	content.WriteString("📉 Прогноз износа батареи:\n")
+	
+	// Рассчитываем прогноз на основе текущего износа и циклов
+	currentWear := data.Wear
+	currentCycles := data.Latest.CycleCount
+	
+	// Предполагаем 1 цикл в день в среднем
+	cyclesPerMonth := 30
+	wearPerCycle := currentWear / float64(max(currentCycles, 1))
+	
+	months := []int{1, 3, 6, 12}
+	for _, m := range months {
+		futureCycles := currentCycles + (cyclesPerMonth * m)
+		futureWear := currentWear + (wearPerCycle * float64(cyclesPerMonth*m))
+		
+		wearStyle := lipgloss.NewStyle()
+		if futureWear < 20 {
+			wearStyle = wearStyle.Foreground(lipgloss.Color("82"))
+		} else if futureWear < 30 {
+			wearStyle = wearStyle.Foreground(lipgloss.Color("226"))
+		} else {
+			wearStyle = wearStyle.Foreground(lipgloss.Color("196"))
+		}
+		
+		content.WriteString(wearStyle.Render(fmt.Sprintf("• Через %d мес: %.1f%% износа (%d циклов)\n", 
+			m, futureWear, futureCycles)))
+	}
+	
+	content.WriteString("\n")
+	
+	// Рекомендации по продлению срока службы
+	content.WriteString("💡 Советы по продлению срока службы:\n")
+	
+	tips := []string{
+		"Держите заряд в диапазоне 20-80% для минимального износа",
+		"Избегайте полной разрядки батареи",
+		"Используйте оригинальное зарядное устройство",
+		"Избегайте перегрева (>45°C) и переохлаждения (<10°C)",
+		"При длительной работе от сети извлекайте батарею (если возможно)",
+	}
+	
+	for _, tip := range tips {
+		content.WriteString(fmt.Sprintf("• %s\n", tip))
+	}
+	
+	// Сравнение с эталонными показателями
+	content.WriteString("\n📊 Сравнение с эталоном MacBook:\n")
+	
+	// Эталонные значения для MacBook
+	benchmarkCycles := 1000
+	benchmarkWear := 20.0
+	
+	cycleHealth := float64(benchmarkCycles-currentCycles) / float64(benchmarkCycles) * 100
+	wearHealth := (benchmarkWear - currentWear) / benchmarkWear * 100
+	
+	if cycleHealth < 0 {
+		cycleHealth = 0
+	}
+	if wearHealth < 0 {
+		wearHealth = 0
+	}
+	
+	content.WriteString(fmt.Sprintf("• Ресурс по циклам: %.0f%%\n", cycleHealth))
+	content.WriteString(fmt.Sprintf("• Состояние по износу: %.0f%%\n", wearHealth))
+	
+	// Общая оценка
+	overallHealth := (cycleHealth + wearHealth) / 2
+	healthStyle := lipgloss.NewStyle().Bold(true)
+	
+	if overallHealth > 70 {
+		healthStyle = healthStyle.Foreground(lipgloss.Color("82"))
+		content.WriteString(healthStyle.Render("\n✅ Батарея в отличном состоянии!"))
+	} else if overallHealth > 40 {
+		healthStyle = healthStyle.Foreground(lipgloss.Color("226"))
+		content.WriteString(healthStyle.Render("\n⚡ Батарея в хорошем состоянии"))
+	} else {
+		healthStyle = healthStyle.Foreground(lipgloss.Color("196"))
+		content.WriteString(healthStyle.Render("\n⚠️ Рекомендуется замена батареи"))
+	}
+	
+	return content.String()
+}
+
+
+// renderExport рендерит экран экспорта
+func (a *App) renderExport() string {
+	content := "📄 Экспорт отчетов\n\n"
+	content += "Экспорт в HTML с автогенерацией имени файла\n\n"
+	content += "Нажмите Enter для экспорта в HTML\n"
+	content += "Файл будет сохранен как report_YYYY-MM-DD.html\n\n"
+	
+	// Показываем статус экспорта если есть
+	if a.exportStatus != "" {
+		content += fmt.Sprintf("Статус: %s\n\n", a.exportStatus)
+	}
+	
+	content += "Нажмите q для возврата в главное меню"
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1).
+		Render(content)
+}
+
+// renderSettings рендерит экран очистки БД
+func (a *App) renderSettings() string {
+	content := "🗑️ Очистка базы данных\n\n"
+	content += "⚠️  ВНИМАНИЕ: Эта операция удалит ВСЕ сохраненные данные!\n\n"
+	content += "Будут удалены:\n"
+	content += "• Все измерения батареи\n"
+	content += "• История состояний\n"
+	content += "• Статистика использования\n\n"
+	content += "Нажмите Y для подтверждения очистки\n"
+	content += "Нажмите q или N для отмены"
+	
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1).
+		Render(content)
+}
+
+// initDashboard инициализирует dashboard
+func (a *App) initDashboard() {
+	// Создаем кастомные прогресс-бары с шириной
+	progressWidth := 30
+	if a.windowWidth > 0 {
+		progressWidth = (a.windowWidth / 2) - 20 // Адаптивная ширина
+		if progressWidth < 20 {
+			progressWidth = 20
+		}
+		if progressWidth > 40 {
+			progressWidth = 40
+		}
+	}
+	
+	batteryGauge := progress.New(
+		progress.WithDefaultGradient(),
+		progress.WithWidth(progressWidth),
+	)
+	
+	wearGauge := progress.New(
+		progress.WithDefaultGradient(),
+		progress.WithWidth(progressWidth),
+	)
+	
+	// Создаем таблицу для последних измерений
+	columns := []table.Column{
+		{Title: "Время", Width: 8},
+		{Title: "Заряд", Width: 6},
+		{Title: "Состояние", Width: 10},
+		{Title: "Темп.", Width: 6},
+	}
+	
+	measureTable := table.New(
+		table.WithColumns(columns),
+		table.WithHeight(6),
+		table.WithFocused(false),
+	)
+	
+	// Инициализация компонентов dashboard
+	a.dashboard = DashboardModel{
+		batteryGauge: batteryGauge,
+		wearGauge:    wearGauge,
+		measureTable: measureTable,
+		lastUpdate:   time.Now(),
+	}
+}
+
+// initReport инициализирует отчет
+func (a *App) initReport() {
+	// Инициализация вкладок
+	tabs := []string{
+		"📊 Обзор",
+		"📈 Графики", 
+		"⚠️ Аномалии",
+		"📜 История",
+		"🔮 Прогнозы",
+	}
+	
+	// Создаем таблицу истории
+	columns := []table.Column{
+		{Title: "Время", Width: 10},
+		{Title: "Заряд %", Width: 8},
+		{Title: "Состояние", Width: 12},
+		{Title: "Темп °C", Width: 8},
+		{Title: "Скорость", Width: 10},
+	}
+	
+	historyTable := table.New(
+		table.WithColumns(columns),
+		table.WithHeight(15),
+		table.WithFocused(false),
+	)
+	
+	a.report = ReportModel{
+		viewHeight:   a.windowHeight - 4,
+		tabs:         tabs,
+		activeTab:    0,
+		historyTable: historyTable,
+		filterState:  "all",
+		sortColumn:   0,
+		sortDesc:     true,
+		lastUpdate:   time.Now(),
+	}
+}
+
+// updateDashboardData обновляет данные dashboard
+func (a *App) updateDashboardData() {
+	a.dashboard.lastUpdate = time.Now()
+	a.dashboard.updating = false
+}
+
+// clearDatabase очищает всю базу данных
+func (a *App) clearDatabase() error {
+	// Останавливаем сервис сбора данных
+	if a.dataService != nil {
+		a.dataService.Stop()
+		
+		// Закрываем соединение с БД
+		if a.dataService.db != nil {
+			a.dataService.db.Close()
+		}
+	}
+	
+	// Удаляем файл базы данных и все связанные файлы
+	dbFiles := []string{
+		dbFile,                // batmon.sqlite
+		dbFile + "-shm",       // batmon.sqlite-shm
+		dbFile + "-wal",       // batmon.sqlite-wal
+	}
+	
+	for _, file := range dbFiles {
+		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+			// Не возвращаем ошибку, если файл не существует
+			// Продолжаем удаление других файлов
+		}
+	}
+	
+	// Очищаем буфер в памяти
+	if a.dataService != nil && a.dataService.buffer != nil {
+		a.dataService.buffer.measurements = make([]Measurement, 0)
+	}
+	
+	// Очищаем локальные данные приложения
+	a.measurements = make([]Measurement, 0)
+	a.latest = nil
+	
+	// Переинициализируем базу данных и сервис
+	db, err := initDB(dbFile)
+	if err != nil {
+		return fmt.Errorf("не удалось переинициализировать БД: %v", err)
+	}
+	
+	// Создаем новый буфер памяти
+	buffer := NewMemoryBuffer(100) // Создаем буфер на 100 записей
+	
+	// Создаем новый сервис сбора данных
+	a.dataService = NewDataService(db, buffer)
+	a.dataService.Start()
+	
 	return nil
 }
