@@ -7,6 +7,14 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: write
+  actions: read
+  security-events: write
+  pull-requests: write
+  issues: write
+  repository-projects: write
+
 jobs:
   build-and-release:
     runs-on: macos-latest
