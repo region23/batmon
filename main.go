@@ -1955,6 +1955,34 @@ func getDashboardHotkeys() []string {
 	}
 }
 
+// safeUpdateChartData безопасно обновляет данные графиков с проверками
+func safeUpdateChartData(batteryChart, capacityChart *widgets.Plot, measurements []Measurement) {
+	if len(measurements) == 0 {
+		// Если данных нет, создаем минимальные данные для отображения
+		batteryChart.Data[0] = []float64{0, 0}
+		capacityChart.Data[0] = []float64{0, 0}
+		return
+	}
+
+	dataSize := len(measurements)
+	if dataSize < 2 {
+		// Дублируем единственную точку для корректной отрисовки
+		batteryChart.Data[0] = make([]float64, 2)
+		batteryChart.Data[0][0] = float64(measurements[0].Percentage)
+		batteryChart.Data[0][1] = float64(measurements[0].Percentage)
+		capacityChart.Data[0] = make([]float64, 2)
+		capacityChart.Data[0][0] = float64(measurements[0].CurrentCapacity)
+		capacityChart.Data[0][1] = float64(measurements[0].CurrentCapacity)
+	} else {
+		batteryChart.Data[0] = make([]float64, len(measurements))
+		capacityChart.Data[0] = make([]float64, len(measurements))
+		for i, m := range measurements {
+			batteryChart.Data[0][i] = float64(m.Percentage)
+			capacityChart.Data[0][i] = float64(m.CurrentCapacity)
+		}
+	}
+}
+
 // showDashboard отображает интерактивный дашборд в терминале
 func showDashboard(db *sqlx.DB, ctx context.Context) error {
 	if err := ui.Init(); err != nil {
@@ -2011,37 +2039,13 @@ renderDashboard:
 	batteryChart.Title = "Заряд батареи (%)"
 	batteryChart.Data = make([][]float64, 1)
 
-	// Убеждаемся, что у нас есть минимум 2 точки для корректной отрисовки
-	dataSize := len(measurements)
-	if dataSize < 2 {
-		// Дублируем единственную точку для корректной отрисовки
-		batteryChart.Data[0] = make([]float64, 2)
-		batteryChart.Data[0][0] = float64(measurements[0].Percentage)
-		batteryChart.Data[0][1] = float64(measurements[0].Percentage)
-	} else {
-		batteryChart.Data[0] = make([]float64, dataSize)
-		for i, m := range measurements {
-			batteryChart.Data[0][i] = float64(m.Percentage)
-		}
-	}
-
 	// График емкости
 	capacityChart := widgets.NewPlot()
 	capacityChart.Title = "Текущая емкость (мАч)"
 	capacityChart.Data = make([][]float64, 1)
 
-	// Убеждаемся, что у нас есть минимум 2 точки для корректной отрисовки
-	if dataSize < 2 {
-		// Дублируем единственную точку для корректной отрисовки
-		capacityChart.Data[0] = make([]float64, 2)
-		capacityChart.Data[0][0] = float64(measurements[0].CurrentCapacity)
-		capacityChart.Data[0][1] = float64(measurements[0].CurrentCapacity)
-	} else {
-		capacityChart.Data[0] = make([]float64, dataSize)
-		for i, m := range measurements {
-			capacityChart.Data[0][i] = float64(m.CurrentCapacity)
-		}
-	}
+	// Безопасно инициализируем данные графиков
+	safeUpdateChartData(batteryChart, capacityChart, measurements)
 
 	// Стили графиков
 	batteryChart.AxesColor = ui.ColorWhite
@@ -2169,13 +2173,8 @@ renderDashboard:
 					measurements = newMeasurements
 					latest = measurements[len(measurements)-1]
 
-					// Обновляем графики
-					batteryChart.Data[0] = make([]float64, len(measurements))
-					capacityChart.Data[0] = make([]float64, len(measurements))
-					for i, m := range measurements {
-						batteryChart.Data[0][i] = float64(m.Percentage)
-						capacityChart.Data[0][i] = float64(m.CurrentCapacity)
-					}
+					// Обновляем графики безопасно
+					safeUpdateChartData(batteryChart, capacityChart, measurements)
 
 					// Пересчитываем статистику
 					wear = computeWear(latest.DesignCapacity, latest.FullChargeCap)
@@ -2285,13 +2284,8 @@ renderDashboard:
 				robustRate, _ := computeAvgRateRobust(measurements, 10)
 				remaining = computeRemainingTime(latest.CurrentCapacity, robustRate)
 
-				// Обновляем все виджеты
-				batteryChart.Data[0] = make([]float64, len(measurements))
-				capacityChart.Data[0] = make([]float64, len(measurements))
-				for i, m := range measurements {
-					batteryChart.Data[0][i] = float64(m.Percentage)
-					capacityChart.Data[0][i] = float64(m.CurrentCapacity)
-				}
+				// Обновляем все виджеты безопасно
+				safeUpdateChartData(batteryChart, capacityChart, measurements)
 
 				stateGauge.Percent = latest.Percentage
 				if latest.Percentage < 20 {
