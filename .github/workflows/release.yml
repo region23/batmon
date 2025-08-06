@@ -144,8 +144,6 @@ jobs:
           1. Откройте **Системные настройки** → **Конфиденциальность и безопасность**
           2. Найдите сообщение о BatMon и нажмите **Все равно открыть**
           3. Или запустите в Терминале: `xattr -d com.apple.quarantine /path/to/BatMon.app`
-        draft: false
-        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
