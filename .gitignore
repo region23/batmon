@@ -5,3 +5,9 @@ batmon
 *.sqlite-wal
 *.log
 *.tmp
+
+advanced_report.html
+advanced_report.md
+
+battery_report.html
+battery_report.md

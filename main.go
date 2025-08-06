@@ -10,10 +10,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"html/template"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -53,9 +56,343 @@ type ChargeCycle struct {
 
 // DataCollector управляет оптимизированным сбором данных
 type DataCollector struct {
+	db               *sqlx.DB
+	buffer           *MemoryBuffer
+	retention        *DataRetention
 	lastProfilerCall time.Time
 	pmsetInterval    time.Duration
 	profilerInterval time.Duration
+}
+
+// ExportOptions содержит настройки экспорта
+type ExportOptions struct {
+	OutputFile    string
+	Format        string // "markdown" или "html"
+	IncludeCharts bool
+}
+
+// ReportData содержит все данные для генерации отчета
+type ReportData struct {
+	GeneratedAt     time.Time
+	Latest          Measurement
+	Measurements    []Measurement
+	HealthAnalysis  map[string]interface{}
+	Wear            float64
+	AvgRate         float64
+	RobustRate      float64
+	ValidIntervals  int
+	RemainingTime   time.Duration
+	Anomalies       []string
+	Recommendations []string
+}
+
+// MemoryBuffer - буфер в памяти для быстрого доступа к последним измерениям
+type MemoryBuffer struct {
+	measurements    []Measurement
+	maxSize         int
+	mu              sync.RWMutex
+	lastCleanup     time.Time
+	cleanupInterval time.Duration
+}
+
+// NewMemoryBuffer создает новый буфер в памяти
+func NewMemoryBuffer(maxSize int) *MemoryBuffer {
+	return &MemoryBuffer{
+		measurements:    make([]Measurement, 0, maxSize),
+		maxSize:         maxSize,
+		lastCleanup:     time.Now(),
+		cleanupInterval: 24 * time.Hour, // Очистка раз в сутки
+	}
+}
+
+// Add добавляет новое измерение в буфер
+func (mb *MemoryBuffer) Add(m Measurement) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	// Добавляем новое измерение
+	mb.measurements = append(mb.measurements, m)
+
+	// Если превышен максимальный размер, удаляем старые записи
+	if len(mb.measurements) > mb.maxSize {
+		// Удаляем первую половину старых записей для оптимизации
+		keepFrom := len(mb.measurements) - mb.maxSize + mb.maxSize/4
+		mb.measurements = mb.measurements[keepFrom:]
+	}
+}
+
+// GetLast возвращает последние N измерений из буфера
+func (mb *MemoryBuffer) GetLast(n int) []Measurement {
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
+
+	if len(mb.measurements) == 0 {
+		return nil
+	}
+
+	if n >= len(mb.measurements) {
+		// Возвращаем копию всех измерений
+		result := make([]Measurement, len(mb.measurements))
+		copy(result, mb.measurements)
+		return result
+	}
+
+	// Возвращаем копию последних n измерений
+	start := len(mb.measurements) - n
+	result := make([]Measurement, n)
+	copy(result, mb.measurements[start:])
+	return result
+}
+
+// GetLatest возвращает последнее измерение
+func (mb *MemoryBuffer) GetLatest() *Measurement {
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
+
+	if len(mb.measurements) == 0 {
+		return nil
+	}
+
+	// Возвращаем копию последнего измерения
+	latest := mb.measurements[len(mb.measurements)-1]
+	return &latest
+}
+
+// Size возвращает текущий размер буфера
+func (mb *MemoryBuffer) Size() int {
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
+	return len(mb.measurements)
+}
+
+// LoadFromDB загружает последние измерения из базы данных в буфер
+func (mb *MemoryBuffer) LoadFromDB(db *sqlx.DB, count int) error {
+	measurements, err := getLastNMeasurements(db, count)
+	if err != nil {
+		return fmt.Errorf("загрузка из БД: %w", err)
+	}
+
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	mb.measurements = measurements
+	return nil
+}
+
+// shouldCleanup проверяет, нужна ли очистка старых данных
+func (mb *MemoryBuffer) shouldCleanup() bool {
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
+	return time.Since(mb.lastCleanup) >= mb.cleanupInterval
+}
+
+// DataRetention управляет ретенцией данных в БД
+type DataRetention struct {
+	db              *sqlx.DB
+	retentionPeriod time.Duration
+	lastCleanup     time.Time
+	cleanupInterval time.Duration
+}
+
+// NewDataRetention создает новый менеджер ретенции данных
+func NewDataRetention(db *sqlx.DB, retentionPeriod time.Duration) *DataRetention {
+	return &DataRetention{
+		db:              db,
+		retentionPeriod: retentionPeriod,
+		lastCleanup:     time.Now(),
+		cleanupInterval: 6 * time.Hour, // Проверка каждые 6 часов
+	}
+}
+
+// Cleanup удаляет старые данные из БД
+func (dr *DataRetention) Cleanup() error {
+	if time.Since(dr.lastCleanup) < dr.cleanupInterval {
+		return nil // Еще рано для очистки
+	}
+
+	cutoffTime := time.Now().Add(-dr.retentionPeriod)
+
+	result, err := dr.db.Exec(`
+		DELETE FROM measurements 
+		WHERE timestamp < ?
+	`, cutoffTime.Format(time.RFC3339))
+
+	if err != nil {
+		return fmt.Errorf("очистка старых данных: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 {
+		log.Printf("🗑️ Удалено %d старых записей (старше %v)", rowsAffected, dr.retentionPeriod)
+
+		// Выполняем VACUUM для освобождения места
+		_, err = dr.db.Exec("VACUUM")
+		if err != nil {
+			log.Printf("⚠️ Ошибка VACUUM: %v", err)
+		}
+	}
+
+	dr.lastCleanup = time.Now()
+	return nil
+}
+
+// GetStats возвращает статистику по данным в БД
+func (dr *DataRetention) GetStats() (map[string]interface{}, error) {
+	var stats map[string]interface{} = make(map[string]interface{})
+
+	// Общее количество записей
+	var totalCount int
+	err := dr.db.Get(&totalCount, "SELECT COUNT(*) FROM measurements")
+	if err != nil {
+		return nil, fmt.Errorf("подсчет записей: %w", err)
+	}
+	stats["total_records"] = totalCount
+
+	// Диапазон дат
+	var oldestDate, newestDate string
+	err = dr.db.Get(&oldestDate, "SELECT MIN(timestamp) FROM measurements")
+	if err == nil {
+		stats["oldest_record"] = oldestDate
+	}
+
+	err = dr.db.Get(&newestDate, "SELECT MAX(timestamp) FROM measurements")
+	if err == nil {
+		stats["newest_record"] = newestDate
+	}
+
+	// Размер БД файла
+	if dbFileInfo, err := os.Stat(dbFile); err == nil {
+		stats["db_size_mb"] = float64(dbFileInfo.Size()) / (1024 * 1024)
+	}
+
+	return stats, nil
+}
+
+// analyzeAdvancedMetrics проводит анализ расширенных метрик батареи
+func analyzeAdvancedMetrics(measurements []Measurement) AdvancedMetrics {
+	if len(measurements) == 0 {
+		return AdvancedMetrics{}
+	}
+
+	var metrics AdvancedMetrics
+	latest := measurements[len(measurements)-1]
+
+	// Анализируем стабильность напряжения
+	voltages := make([]float64, 0)
+	powers := make([]float64, 0)
+	chargingEfficiencies := make([]float64, 0)
+
+	for _, m := range measurements {
+		if m.Voltage > 0 {
+			voltages = append(voltages, float64(m.Voltage))
+		}
+		if m.Power != 0 {
+			powers = append(powers, float64(m.Power))
+		}
+
+		// Эффективность зарядки (емкость / мощность)
+		if m.Power > 0 && m.CurrentCapacity > 0 {
+			efficiency := float64(m.CurrentCapacity) / float64(m.Power)
+			chargingEfficiencies = append(chargingEfficiencies, efficiency)
+		}
+	}
+
+	// Стабильность напряжения (коэффициент вариации)
+	if len(voltages) > 1 {
+		mean := 0.0
+		for _, v := range voltages {
+			mean += v
+		}
+		mean /= float64(len(voltages))
+
+		variance := 0.0
+		for _, v := range voltages {
+			variance += (v - mean) * (v - mean)
+		}
+		variance /= float64(len(voltages))
+		stdDev := math.Sqrt(variance)
+
+		if mean > 0 {
+			metrics.VoltageStability = 100 * (1 - stdDev/mean) // В процентах
+		}
+	}
+
+	// Эффективность энергопотребления
+	if len(powers) > 0 {
+		avgPower := 0.0
+		for _, p := range powers {
+			avgPower += math.Abs(p) // Берем абсолютную величину
+		}
+		avgPower /= float64(len(powers))
+
+		// Нормализуем эффективность (меньше мощность = выше эффективность)
+		if avgPower > 0 {
+			metrics.PowerEfficiency = math.Max(0, 100-avgPower/100)
+		}
+	}
+
+	// Эффективность зарядки
+	if len(chargingEfficiencies) > 0 {
+		avgEfficiency := 0.0
+		for _, e := range chargingEfficiencies {
+			avgEfficiency += e
+		}
+		metrics.ChargingEfficiency = avgEfficiency / float64(len(chargingEfficiencies))
+	}
+
+	// Тренд энергопотребления
+	if len(powers) >= 3 {
+		recent := powers[len(powers)-3:]
+		trend := "стабильное"
+
+		if len(recent) == 3 {
+			if recent[2] > recent[1] && recent[1] > recent[0] {
+				trend = "растущее потребление"
+			} else if recent[2] < recent[1] && recent[1] < recent[0] {
+				trend = "снижающееся потребление"
+			}
+		}
+		metrics.PowerTrend = trend
+	}
+
+	// Общий рейтинг здоровья
+	healthScore := 100
+
+	// Снижаем за износ
+	if latest.DesignCapacity > 0 {
+		wear := float64(latest.DesignCapacity-latest.FullChargeCap) / float64(latest.DesignCapacity) * 100
+		healthScore -= int(wear * 0.5) // Износ влияет на 50%
+	}
+
+	// Снижаем за циклы
+	cycleImpact := latest.CycleCount / 10 // Каждые 10 циклов = -1 балл
+	healthScore -= cycleImpact
+
+	// Снижаем за температуру
+	if latest.Temperature > 45 {
+		healthScore -= (latest.Temperature - 45) // Каждый градус свыше 45°C = -1 балл
+	}
+
+	// Учитываем стабильность напряжения
+	if metrics.VoltageStability < 95 {
+		healthScore -= int(95 - metrics.VoltageStability)
+	}
+
+	metrics.HealthRating = int(math.Max(0, float64(healthScore)))
+
+	// Статус от Apple
+	metrics.AppleStatus = latest.AppleCondition
+	if metrics.AppleStatus == "" {
+		if metrics.HealthRating >= 85 {
+			metrics.AppleStatus = "Normal"
+		} else if metrics.HealthRating >= 70 {
+			metrics.AppleStatus = "Service Recommended"
+		} else {
+			metrics.AppleStatus = "Replace Soon"
+		}
+	}
+
+	return metrics
 }
 
 // Measurement – запись о состоянии батареи.
@@ -69,6 +406,21 @@ type Measurement struct {
 	DesignCapacity  int    `db:"design_capacity"`
 	CurrentCapacity int    `db:"current_capacity"`
 	Temperature     int    `db:"temperature"` // температура батареи в °C
+	// Расширенные метрики (Этап 6)
+	Voltage        int    `db:"voltage"`         // Напряжение в мВ
+	Amperage       int    `db:"amperage"`        // Ток в мА (+ заряд, - разряд)
+	Power          int    `db:"power"`           // Мощность в мВт
+	AppleCondition string `db:"apple_condition"` // Статус от Apple
+}
+
+// AdvancedMetrics содержит расширенные метрики анализа
+type AdvancedMetrics struct {
+	PowerEfficiency    float64 `json:"power_efficiency"`    // Эффективность энергопотребления
+	VoltageStability   float64 `json:"voltage_stability"`   // Стабильность напряжения
+	ChargingEfficiency float64 `json:"charging_efficiency"` // Эффективность зарядки
+	PowerTrend         string  `json:"power_trend"`         // Тренд энергопотребления
+	HealthRating       int     `json:"health_rating"`       // Общий рейтинг здоровья (0-100)
+	AppleStatus        string  `json:"apple_status"`        // Статус от Apple (Normal, Replace Soon, etc.)
 }
 
 // initDB открывает соединение с SQLite и создаёт таблицу, если её нет.
@@ -92,11 +444,28 @@ func initDB(path string) (*sqlx.DB, error) {
 		full_charge_capacity INTEGER,
 		design_capacity INTEGER,
 		current_capacity INTEGER,
-		temperature INTEGER DEFAULT 0
+		temperature INTEGER DEFAULT 0,
+		voltage INTEGER DEFAULT 0,
+		amperage INTEGER DEFAULT 0,
+		power INTEGER DEFAULT 0,
+		apple_condition TEXT DEFAULT ''
 	);`
 	if _, err = db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("создание таблицы: %w", err)
 	}
+
+	// Добавляем новые столбцы к существующей таблице (для обновления схемы)
+	alterQueries := []string{
+		"ALTER TABLE measurements ADD COLUMN voltage INTEGER DEFAULT 0",
+		"ALTER TABLE measurements ADD COLUMN amperage INTEGER DEFAULT 0",
+		"ALTER TABLE measurements ADD COLUMN power INTEGER DEFAULT 0",
+		"ALTER TABLE measurements ADD COLUMN apple_condition TEXT DEFAULT ''",
+	}
+
+	for _, query := range alterQueries {
+		db.Exec(query) // Игнорируем ошибки - столбцы могут уже существовать
+	}
+
 	return db, nil
 }
 
@@ -125,14 +494,14 @@ func parsePMSet() (int, string, error) {
 }
 
 // parseSystemProfiler получает данные из system_profiler.
-func parseSystemProfiler() (int, int, int, int, int, error) {
+func parseSystemProfiler() (cycle, fullCap, designCap, currCap, temperature, voltage, amperage int, condition string, err error) {
 	cmd := exec.Command("system_profiler", "SPPowerDataType", "-detailLevel", "full")
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, 0, 0, 0, 0, fmt.Errorf("system_profiler: %w", err)
+	out, cmdErr := cmd.Output()
+	if cmdErr != nil {
+		return 0, 0, 0, 0, 0, 0, 0, "", fmt.Errorf("system_profiler: %w", cmdErr)
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(out))
-	var cycle, fullCap, designCap, currCap, temperature int
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		switch {
@@ -153,12 +522,29 @@ func parseSystemProfiler() (int, int, int, int, int, error) {
 			// Удаляем " C" в конце и конвертируем в целое число
 			val = strings.Replace(val, " C", "", -1)
 			temperature, _ = strconv.Atoi(val)
+		case strings.HasPrefix(line, "Voltage:"):
+			// Парсим напряжение (например, "Voltage: 12345 mV")
+			val := strings.TrimSpace(strings.TrimPrefix(line, "Voltage:"))
+			if strings.Contains(val, "mV") {
+				val = strings.Fields(val)[0]
+				voltage, _ = strconv.Atoi(val)
+			}
+		case strings.HasPrefix(line, "Amperage:"):
+			// Парсим ток (например, "Amperage: -1234 mA")
+			val := strings.TrimSpace(strings.TrimPrefix(line, "Amperage:"))
+			if strings.Contains(val, "mA") {
+				val = strings.Fields(val)[0]
+				amperage, _ = strconv.Atoi(val)
+			}
+		case strings.HasPrefix(line, "Condition:"):
+			// Парсим состояние от Apple (например, "Condition: Normal")
+			condition = strings.TrimSpace(strings.TrimPrefix(line, "Condition:"))
 		}
 	}
-	if err = scanner.Err(); err != nil {
-		return 0, 0, 0, 0, 0, fmt.Errorf("сканирование system_profiler: %w", err)
+	if scanErr := scanner.Err(); scanErr != nil {
+		return 0, 0, 0, 0, 0, 0, 0, "", fmt.Errorf("сканирование system_profiler: %w", scanErr)
 	}
-	return cycle, fullCap, designCap, currCap, temperature, nil
+	return cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, nil
 }
 
 // getMeasurement собирает все данные о батарее и возвращает Measurement.
@@ -167,9 +553,16 @@ func getMeasurement() (*Measurement, error) {
 	if pmErr != nil {
 		log.Printf("pmset: %v", pmErr)
 	}
-	cycle, fullCap, designCap, currCap, temperature, spErr := parseSystemProfiler()
+	cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, spErr := parseSystemProfiler()
 	if spErr != nil {
 		log.Printf("system_profiler: %v", spErr)
+	}
+
+	// Вычисляем мощность (P = U * I)
+	power := 0
+	if voltage > 0 && amperage != 0 {
+		// Преобразуем мВ * мА в мВт
+		power = (voltage * amperage) / 1000
 	}
 
 	return &Measurement{
@@ -181,6 +574,10 @@ func getMeasurement() (*Measurement, error) {
 		DesignCapacity:  designCap,
 		CurrentCapacity: currCap,
 		Temperature:     temperature,
+		Voltage:         voltage,
+		Amperage:        amperage,
+		Power:           power,
+		AppleCondition:  condition,
 	}, nil
 }
 
@@ -188,11 +585,13 @@ func getMeasurement() (*Measurement, error) {
 func insertMeasurement(db *sqlx.DB, m *Measurement) error {
 	query := `INSERT INTO measurements (
 		timestamp, percentage, state, cycle_count,
-		full_charge_capacity, design_capacity, current_capacity, temperature)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		full_charge_capacity, design_capacity, current_capacity, temperature,
+		voltage, amperage, power, apple_condition)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	_, err := db.Exec(query,
 		m.Timestamp, m.Percentage, m.State, m.CycleCount,
-		m.FullChargeCap, m.DesignCapacity, m.CurrentCapacity, m.Temperature)
+		m.FullChargeCap, m.DesignCapacity, m.CurrentCapacity, m.Temperature,
+		m.Voltage, m.Amperage, m.Power, m.AppleCondition)
 	return err
 }
 
@@ -707,6 +1106,518 @@ func analyzeBatteryHealth(ms []Measurement) map[string]interface{} {
 	return analysis
 }
 
+// exportToMarkdown экспортирует отчет в формате Markdown
+func exportToMarkdown(data ReportData, filename string) error {
+	content := fmt.Sprintf(`# 🔋 Отчет о состоянии батареи MacBook
+
+**Дата создания:** %s
+
+## 💼 Краткое резюме
+
+`, data.GeneratedAt.Format("02.01.2006 15:04:05"))
+
+	if data.HealthAnalysis != nil {
+		if status, ok := data.HealthAnalysis["health_status"].(string); ok {
+			score, _ := data.HealthAnalysis["health_score"].(int)
+			content += fmt.Sprintf("- **Здоровье батареи:** %s (рейтинг %d/100)\n", status, score)
+		}
+	}
+	content += fmt.Sprintf("- **Циклы:** %d\n", data.Latest.CycleCount)
+	content += fmt.Sprintf("- **Износ:** %.1f%%\n", data.Wear)
+	if data.RemainingTime > 0 {
+		content += fmt.Sprintf("- **Оставшееся время:** %s\n", data.RemainingTime.Truncate(time.Minute))
+	}
+
+	content += fmt.Sprintf(`
+## 🔋 Текущее состояние батареи
+
+| Параметр | Значение |
+|----------|----------|
+| Время измерения | %s |
+| Заряд | %d%% |
+| Состояние | %s |
+| Циклы зарядки | %d |
+| Полная ёмкость | %d мАч |
+| Проектная ёмкость | %d мАч |
+| Текущая ёмкость | %d мАч |
+`,
+		data.Latest.Timestamp,
+		data.Latest.Percentage,
+		formatStateForExport(data.Latest.State, data.Latest.Percentage),
+		data.Latest.CycleCount,
+		data.Latest.FullChargeCap,
+		data.Latest.DesignCapacity,
+		data.Latest.CurrentCapacity)
+
+	if data.Latest.Temperature > 0 {
+		content += fmt.Sprintf("| Температура | %d°C |\n", data.Latest.Temperature)
+	}
+
+	content += "\n## 📊 Анализ здоровья батареи\n\n"
+	if data.HealthAnalysis != nil {
+		if status, ok := data.HealthAnalysis["health_status"].(string); ok {
+			score, _ := data.HealthAnalysis["health_score"].(int)
+			content += fmt.Sprintf("**Общее состояние:** %s (оценка: %d/100)\n\n", status, score)
+		}
+		content += fmt.Sprintf("**Износ батареи:** %.1f%%\n\n", data.Wear)
+
+		// Анализ трендов
+		if trendAnalysis, ok := data.HealthAnalysis["trend_analysis"].(TrendAnalysis); ok {
+			if trendAnalysis.DegradationRate != 0 {
+				content += fmt.Sprintf("**Тренд деградации:** %.2f%% в месяц\n\n", trendAnalysis.DegradationRate)
+				if trendAnalysis.ProjectedLifetime > 0 {
+					content += fmt.Sprintf("**Прогноз до 80%% емкости:** ~%d дней\n\n", trendAnalysis.ProjectedLifetime)
+				}
+			}
+		}
+
+		if len(data.Anomalies) > 0 {
+			content += fmt.Sprintf("### ⚠️ Обнаруженные аномалии (%d)\n\n", len(data.Anomalies))
+			for i, anomaly := range data.Anomalies {
+				if i >= 10 { // Показываем максимум 10 аномалий в экспорте
+					content += fmt.Sprintf("... и еще %d аномалий\n\n", len(data.Anomalies)-i)
+					break
+				}
+				content += fmt.Sprintf("- %s\n", anomaly)
+			}
+			content += "\n"
+		}
+
+		if len(data.Recommendations) > 0 {
+			content += "### 💡 Рекомендации\n\n"
+			for _, rec := range data.Recommendations {
+				content += fmt.Sprintf("- %s\n", rec)
+			}
+			content += "\n"
+		}
+	}
+
+	content += "## 📈 Статистика разрядки\n\n"
+	if data.AvgRate > 0 {
+		content += fmt.Sprintf("- **Простая скорость разрядки:** %.2f мАч/час\n", data.AvgRate)
+	}
+	if data.RobustRate > 0 {
+		content += fmt.Sprintf("- **Робастная скорость разрядки:** %.2f мАч/час (на основе %d валидных интервалов)\n", data.RobustRate, data.ValidIntervals)
+	}
+	if data.RemainingTime > 0 {
+		content += fmt.Sprintf("- **Оставшееся время работы:** %s\n", data.RemainingTime.Truncate(time.Minute))
+	}
+
+	content += "\n## 📋 Последние измерения\n\n"
+	content += "| Время | Заряд | Состояние | Цикл | Полная емк. | Проект. емк. | Текущ. емк. | Темп. |\n"
+	content += "|-------|-------|-----------|------|-------------|--------------|-------------|-------|\n"
+
+	startIdx := 0
+	if len(data.Measurements) > 15 {
+		startIdx = len(data.Measurements) - 15 // Показываем последние 15 в экспорте
+	}
+
+	for i := startIdx; i < len(data.Measurements); i++ {
+		if i < 0 {
+			continue
+		}
+		m := data.Measurements[i]
+		timeStr := m.Timestamp[11:19] // только время
+		tempStr := "-"
+		if m.Temperature > 0 {
+			tempStr = fmt.Sprintf("%d°C", m.Temperature)
+		}
+
+		content += fmt.Sprintf("| %s | %d%% | %s | %d | %d | %d | %d | %s |\n",
+			timeStr, m.Percentage, formatStateForExport(m.State, m.Percentage),
+			m.CycleCount, m.FullChargeCap, m.DesignCapacity, m.CurrentCapacity, tempStr)
+	}
+
+	content += "\n---\n*Отчет сгенерирован утилитой batmon v2.0*\n"
+
+	return os.WriteFile(filename, []byte(content), 0644)
+}
+
+// exportToHTML экспортирует отчет в формате HTML с графиками
+func exportToHTML(data ReportData, filename string) error {
+	tmpl := `<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔋 Отчет о состоянии батареи MacBook</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
+            margin: 40px; 
+            background-color: #f5f5f7; 
+            color: #1d1d1f;
+        }
+        .container { 
+            max-width: 1200px; 
+            margin: 0 auto; 
+            background: white; 
+            padding: 40px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+        .header { 
+            text-align: center; 
+            margin-bottom: 40px; 
+            padding-bottom: 20px;
+            border-bottom: 2px solid #e5e5e7;
+        }
+        .summary { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            color: white; 
+            padding: 30px; 
+            border-radius: 12px; 
+            margin-bottom: 30px; 
+        }
+        .grid { 
+            display: grid; 
+            grid-template-columns: 1fr 1fr; 
+            gap: 30px; 
+            margin-bottom: 30px; 
+        }
+        .card { 
+            background: #f8f9fa; 
+            padding: 25px; 
+            border-radius: 8px; 
+            border: 1px solid #e9ecef;
+        }
+        .status-good { color: #28a745; font-weight: bold; }
+        .status-warning { color: #ffc107; font-weight: bold; }
+        .status-critical { color: #dc3545; font-weight: bold; }
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            margin-top: 20px; 
+        }
+        th, td { 
+            padding: 12px; 
+            text-align: left; 
+            border-bottom: 1px solid #ddd; 
+        }
+        th { 
+            background-color: #f8f9fa; 
+            font-weight: 600;
+        }
+        .chart-container { 
+            position: relative; 
+            height: 400px; 
+            margin: 20px 0; 
+        }
+        .anomaly { 
+            background: #fff3cd; 
+            border: 1px solid #ffeaa7; 
+            padding: 15px; 
+            border-radius: 6px; 
+            margin: 10px 0; 
+        }
+        .recommendation { 
+            background: #d1edff; 
+            border: 1px solid #74b9ff; 
+            padding: 15px; 
+            border-radius: 6px; 
+            margin: 10px 0; 
+        }
+        .footer { 
+            text-align: center; 
+            margin-top: 40px; 
+            padding-top: 20px; 
+            border-top: 1px solid #e5e5e7; 
+            color: #86868b; 
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔋 Отчет о состоянии батареи MacBook</h1>
+            <p>Дата создания: {{.GeneratedAt.Format "02.01.2006 15:04:05"}}</p>
+        </div>
+
+        <div class="summary">
+            <h2>💼 Краткое резюме</h2>
+            {{if .HealthAnalysis}}
+                {{if index .HealthAnalysis "health_status"}}
+                    <p>🏥 <strong>Здоровье батареи:</strong> {{index .HealthAnalysis "health_status"}} (рейтинг {{index .HealthAnalysis "health_score"}}/100)</p>
+                {{end}}
+            {{end}}
+            <p>🔄 <strong>Циклы:</strong> {{.Latest.CycleCount}}</p>
+            <p>📉 <strong>Износ:</strong> {{printf "%.1f" .Wear}}%</p>
+            {{if gt .RemainingTime 0}}
+                <p>⏰ <strong>Оставшееся время:</strong> {{.RemainingTime.Truncate 1000000000}}</p>
+            {{end}}
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h3>📊 Графики</h3>
+                <div class="chart-container">
+                    <canvas id="batteryChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <canvas id="capacityChart"></canvas>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>🔋 Текущее состояние</h3>
+                <table>
+                    <tr><td><strong>Заряд</strong></td><td>{{.Latest.Percentage}}%</td></tr>
+                    <tr><td><strong>Состояние</strong></td><td>{{.Latest.State}}</td></tr>
+                    <tr><td><strong>Циклы</strong></td><td>{{.Latest.CycleCount}}</td></tr>
+                    <tr><td><strong>Полная ёмкость</strong></td><td>{{.Latest.FullChargeCap}} мАч</td></tr>
+                    <tr><td><strong>Проектная ёмкость</strong></td><td>{{.Latest.DesignCapacity}} мАч</td></tr>
+                    <tr><td><strong>Текущая ёмкость</strong></td><td>{{.Latest.CurrentCapacity}} мАч</td></tr>
+                    {{if gt .Latest.Temperature 0}}
+                        <tr><td><strong>Температура</strong></td><td>{{.Latest.Temperature}}°C</td></tr>
+                    {{end}}
+                </table>
+            </div>
+        </div>
+
+        {{if .Anomalies}}
+        <div class="card">
+            <h3>⚠️ Обнаруженные аномалии ({{len .Anomalies}})</h3>
+            {{range $index, $anomaly := .Anomalies}}
+                {{if lt $index 10}}
+                    <div class="anomaly">{{$anomaly}}</div>
+                {{end}}
+            {{end}}
+            {{if gt (len .Anomalies) 10}}
+                <p>... и еще {{sub (len .Anomalies) 10}} аномалий</p>
+            {{end}}
+        </div>
+        {{end}}
+
+        {{if .Recommendations}}
+        <div class="card">
+            <h3>💡 Рекомендации</h3>
+            {{range .Recommendations}}
+                <div class="recommendation">{{.}}</div>
+            {{end}}
+        </div>
+        {{end}}
+
+        <div class="card">
+            <h3>📋 Последние измерения</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Время</th>
+                        <th>Заряд</th>
+                        <th>Состояние</th>
+                        <th>Цикл</th>
+                        <th>Полная емк.</th>
+                        <th>Текущ. емк.</th>
+                        <th>Темп.</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{$len := len .Measurements}}
+                    {{$start := 0}}
+                    {{if gt $len 15}}
+                        {{$start = sub $len 15}}
+                    {{end}}
+                    {{range $index, $m := .Measurements}}
+                        {{if ge $index $start}}
+                            <tr>
+                                <td>{{slice $m.Timestamp 11 19}}</td>
+                                <td>{{$m.Percentage}}%</td>
+                                <td>{{$m.State}}</td>
+                                <td>{{$m.CycleCount}}</td>
+                                <td>{{$m.FullChargeCap}} мАч</td>
+                                <td>{{$m.CurrentCapacity}} мАч</td>
+                                <td>{{if gt $m.Temperature 0}}{{$m.Temperature}}°C{{else}}-{{end}}</td>
+                            </tr>
+                        {{end}}
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="footer">
+            <p><em>Отчет сгенерирован утилитой batmon v2.0</em></p>
+        </div>
+    </div>
+
+    <script>
+        // График заряда батареи
+        const batteryCtx = document.getElementById('batteryChart').getContext('2d');
+        const batteryData = [
+            {{range $index, $m := .Measurements}}
+                {{if lt $index 20}}{{$m.Percentage}},{{end}}
+            {{end}}
+        ];
+        
+        new Chart(batteryCtx, {
+            type: 'line',
+            data: {
+                labels: [
+                    {{range $index, $m := .Measurements}}
+                        {{if lt $index 20}}'{{slice $m.Timestamp 11 19}}',{{end}}
+                    {{end}}
+                ],
+                datasets: [{
+                    label: 'Заряд (%)',
+                    data: batteryData,
+                    borderColor: '#28a745',
+                    backgroundColor: 'rgba(40, 167, 69, 0.1)',
+                    fill: true,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Заряд батареи (%)'
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 100
+                    }
+                }
+            }
+        });
+
+        // График емкости
+        const capacityCtx = document.getElementById('capacityChart').getContext('2d');
+        const capacityData = [
+            {{range $index, $m := .Measurements}}
+                {{if lt $index 20}}{{$m.CurrentCapacity}},{{end}}
+            {{end}}
+        ];
+        
+        new Chart(capacityCtx, {
+            type: 'line',
+            data: {
+                labels: [
+                    {{range $index, $m := .Measurements}}
+                        {{if lt $index 20}}'{{slice $m.Timestamp 11 19}}',{{end}}
+                    {{end}}
+                ],
+                datasets: [{
+                    label: 'Емкость (мАч)',
+                    data: capacityData,
+                    borderColor: '#007bff',
+                    backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                    fill: true,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Текущая емкость (мАч)'
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>`
+
+	// Добавляем вспомогательные функции для шаблона
+	funcMap := template.FuncMap{
+		"sub": func(a, b int) int {
+			return a - b
+		},
+	}
+
+	t, err := template.New("report").Funcs(funcMap).Parse(tmpl)
+	if err != nil {
+		return fmt.Errorf("парсинг шаблона: %w", err)
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("создание файла: %w", err)
+	}
+	defer file.Close()
+
+	return t.Execute(file, data)
+}
+
+// formatStateForExport форматирует состояние батареи для экспорта (без эмодзи)
+func formatStateForExport(state string, percentage int) string {
+	if state == "" {
+		return "Неизвестно"
+	}
+
+	stateLower := strings.ToLower(state)
+	stateFormatted := strings.ToUpper(string(stateLower[0])) + stateLower[1:]
+
+	switch stateLower {
+	case "charging":
+		if percentage >= 90 {
+			return stateFormatted + " (почти полная)"
+		}
+		return stateFormatted
+	case "discharging":
+		if percentage < 20 {
+			return stateFormatted + " (низкий заряд)"
+		}
+		return stateFormatted
+	case "charged":
+		return stateFormatted
+	case "finishing":
+		return stateFormatted
+	default:
+		return stateFormatted
+	}
+}
+
+// generateReportData собирает данные для отчета
+func generateReportData(db *sqlx.DB) (ReportData, error) {
+	ms, err := getLastNMeasurements(db, 50)
+	if err != nil {
+		return ReportData{}, fmt.Errorf("получение данных: %w", err)
+	}
+	if len(ms) == 0 {
+		return ReportData{}, fmt.Errorf("нет данных для отчета")
+	}
+
+	latest := ms[len(ms)-1]
+	avgRate := computeAvgRate(ms, 5)
+	robustRate, validIntervals := computeAvgRateRobust(ms, 10)
+	remaining := computeRemainingTime(latest.CurrentCapacity, robustRate)
+	wear := computeWear(latest.DesignCapacity, latest.FullChargeCap)
+	healthAnalysis := analyzeBatteryHealth(ms)
+
+	var anomalies []string
+	var recommendations []string
+
+	if healthAnalysis != nil {
+		if anomaliesList, ok := healthAnalysis["anomalies"].([]string); ok {
+			anomalies = anomaliesList
+		}
+		if recsList, ok := healthAnalysis["recommendations"].([]string); ok {
+			recommendations = recsList
+		}
+	}
+
+	return ReportData{
+		GeneratedAt:     time.Now(),
+		Latest:          latest,
+		Measurements:    ms,
+		HealthAnalysis:  healthAnalysis,
+		Wear:            wear,
+		AvgRate:         avgRate,
+		RobustRate:      robustRate,
+		ValidIntervals:  validIntervals,
+		RemainingTime:   remaining,
+		Anomalies:       anomalies,
+		Recommendations: recommendations,
+	}, nil
+}
+
 // isOnBattery проверяет, работает ли система от батареи
 func isOnBattery() (bool, string, int, error) {
 	pct, state, err := parsePMSet()
@@ -722,86 +1633,182 @@ func isOnBattery() (bool, string, int, error) {
 }
 
 // backgroundDataCollection запускает сбор данных в фоне с оптимизацией частоты
+// NewDataCollector создает новый коллектор данных с буферизацией
+func NewDataCollector(db *sqlx.DB) *DataCollector {
+	buffer := NewMemoryBuffer(100)                     // Буфер на последние 100 измерений
+	retention := NewDataRetention(db, 90*24*time.Hour) // Хранение 3 месяца
+
+	collector := &DataCollector{
+		db:               db,
+		buffer:           buffer,
+		retention:        retention,
+		lastProfilerCall: time.Time{},
+		pmsetInterval:    30 * time.Second,
+		profilerInterval: 2 * time.Minute,
+	}
+
+	// Загружаем существующие данные в буфер
+	if err := buffer.LoadFromDB(db, 100); err != nil {
+		log.Printf("⚠️ Ошибка загрузки данных в буфер: %v", err)
+	} else {
+		log.Printf("📦 Загружено %d измерений в буфер памяти", buffer.Size())
+	}
+
+	return collector
+}
+
+// collectAndStore собирает данные и сохраняет их в БД и буфер
+func (dc *DataCollector) collectAndStore() error {
+	// Получаем базовые данные от pmset
+	pct, state, pmErr := parsePMSet()
+	if pmErr != nil {
+		return fmt.Errorf("сбор данных pmset: %w", pmErr)
+	}
+
+	// Создаем базовое измерение
+	m := &Measurement{
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		Percentage:      pct,
+		State:           state,
+		CycleCount:      0, // Будет обновлено ниже
+		FullChargeCap:   0,
+		DesignCapacity:  0,
+		CurrentCapacity: 0,
+		Temperature:     0,
+	}
+
+	// Добавляем подробные данные от system_profiler, если пора
+	if time.Since(dc.lastProfilerCall) >= dc.profilerInterval {
+		cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, spErr := parseSystemProfiler()
+		if spErr == nil {
+			m.CycleCount = cycle
+			m.FullChargeCap = fullCap
+			m.DesignCapacity = designCap
+			m.CurrentCapacity = currCap
+			m.Temperature = temperature
+			m.Voltage = voltage
+			m.Amperage = amperage
+			m.AppleCondition = condition
+
+			// Вычисляем мощность
+			if voltage > 0 && amperage != 0 {
+				m.Power = (voltage * amperage) / 1000
+			}
+
+			dc.lastProfilerCall = time.Now()
+		} else {
+			// Если system_profiler не работает, используем предыдущие значения
+			if latest := dc.buffer.GetLatest(); latest != nil {
+				m.CycleCount = latest.CycleCount
+				m.FullChargeCap = latest.FullChargeCap
+				m.DesignCapacity = latest.DesignCapacity
+				m.CurrentCapacity = latest.CurrentCapacity
+				m.Temperature = latest.Temperature
+				m.Voltage = latest.Voltage
+				m.Amperage = latest.Amperage
+				m.Power = latest.Power
+				m.AppleCondition = latest.AppleCondition
+			}
+			log.Printf("⚠️ system_profiler недоступен, используем кэшированные значения: %v", spErr)
+		}
+	} else {
+		// Используем последние известные значения
+		if latest := dc.buffer.GetLatest(); latest != nil {
+			m.CycleCount = latest.CycleCount
+			m.FullChargeCap = latest.FullChargeCap
+			m.DesignCapacity = latest.DesignCapacity
+			m.CurrentCapacity = latest.CurrentCapacity
+			m.Temperature = latest.Temperature
+		}
+	}
+
+	// Сохраняем в БД
+	if err := insertMeasurement(dc.db, m); err != nil {
+		return fmt.Errorf("сохранение в БД: %w", err)
+	}
+
+	// Добавляем в буфер памяти
+	dc.buffer.Add(*m)
+
+	// Периодическая очистка старых данных
+	if err := dc.retention.Cleanup(); err != nil {
+		log.Printf("⚠️ Ошибка очистки данных: %v", err)
+	}
+
+	return nil
+}
+
+// GetLatestFromBuffer возвращает последнее измерение из буфера (быстро)
+func (dc *DataCollector) GetLatestFromBuffer() *Measurement {
+	return dc.buffer.GetLatest()
+}
+
+// GetLastNFromBuffer возвращает последние N измерений из буфера (быстро)
+func (dc *DataCollector) GetLastNFromBuffer(n int) []Measurement {
+	return dc.buffer.GetLast(n)
+}
+
+// GetStats возвращает статистику по данным
+func (dc *DataCollector) GetStats() (map[string]interface{}, error) {
+	dbStats, err := dc.retention.GetStats()
+	if err != nil {
+		return nil, fmt.Errorf("статистика БД: %w", err)
+	}
+
+	dbStats["buffer_size"] = dc.buffer.Size()
+	dbStats["buffer_max_size"] = dc.buffer.maxSize
+
+	return dbStats, nil
+}
+
+// backgroundDataCollection запускает фоновый сбор данных с оптимизацией
 func backgroundDataCollection(db *sqlx.DB, ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	collector := &DataCollector{
-		pmsetInterval:    pmsetInterval,
-		profilerInterval: profilerInterval,
-	}
+	// Создаем оптимизированный коллектор с буферизацией
+	collector := NewDataCollector(db)
 
 	// Делаем первое измерение
-	meas, err := getMeasurement()
-	if err != nil {
-		log.Printf("первичное измерение: %v", err)
-		return
-	}
-	collector.lastProfilerCall = time.Now()
-
-	if err = insertMeasurement(db, meas); err != nil {
-		log.Printf("запись первой записи: %v", err)
+	if err := collector.collectAndStore(); err != nil {
+		log.Printf("⚠️ Первичное измерение: %v", err)
 	}
 
 	ticker := time.NewTicker(collector.pmsetInterval)
 	defer ticker.Stop()
 
+	log.Printf("🔄 Фоновый сбор данных запущен (pmset: %v, system_profiler: %v)",
+		collector.pmsetInterval, collector.profilerInterval)
+
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println("🛑 Остановка фонового сбора данных")
 			return
 		case <-ticker.C:
-			// Определяем, нужно ли вызывать system_profiler
-			needProfiler := time.Since(collector.lastProfilerCall) >= collector.profilerInterval
-
-			var m *Measurement
-			if needProfiler {
-				// Полное измерение с system_profiler
-				m, err = getMeasurement()
-				collector.lastProfilerCall = time.Now()
-			} else {
-				// Только pmset для быстрого обновления процента заряда
-				pct, state, pmErr := parsePMSet()
-				if pmErr != nil {
-					log.Printf("pmset: %v", pmErr)
-					continue
-				}
-
-				// Используем последние известные данные для остальных полей
-				lastMs, dbErr := getLastNMeasurements(db, 1)
-				if dbErr != nil || len(lastMs) == 0 {
-					// Если нет предыдущих данных, делаем полное измерение
-					m, err = getMeasurement()
-					collector.lastProfilerCall = time.Now()
-				} else {
-					last := lastMs[0]
-					m = &Measurement{
-						Timestamp:       time.Now().UTC().Format(time.RFC3339),
-						Percentage:      pct,
-						State:           state,
-						CycleCount:      last.CycleCount,
-						FullChargeCap:   last.FullChargeCap,
-						DesignCapacity:  last.DesignCapacity,
-						CurrentCapacity: last.CurrentCapacity,
-						Temperature:     last.Temperature,
-					}
-				}
-			}
-
-			if err != nil {
-				log.Printf("измерение: %v", err)
+			if err := collector.collectAndStore(); err != nil {
+				log.Printf("⚠️ Ошибка сбора данных: %v", err)
 				continue
 			}
-			if err = insertMeasurement(db, m); err != nil {
-				log.Printf("запись измерения: %v", err)
+
+			// Логируем статистику иногда
+			if collector.buffer.Size()%50 == 0 && collector.buffer.Size() > 0 {
+				stats, err := collector.GetStats()
+				if err == nil {
+					log.Printf("📊 Статистика: буфер %d/%d, БД %v записей",
+						stats["buffer_size"], stats["buffer_max_size"], stats["total_records"])
+				}
 			}
 
-			// Если подключили зарядку или батарея села, можно замедлить сбор
-			if strings.ToLower(m.State) == "charging" && m.Percentage >= 100 {
-				log.Println("Батарея полностью заряжена, замедляем сбор данных")
-				ticker.Reset(5 * time.Minute)
-			} else if strings.ToLower(m.State) == "discharging" {
-				// Возвращаем нормальный интервал при разрядке
-				ticker.Reset(collector.pmsetInterval)
+			// Адаптивная частота сбора данных
+			latest := collector.GetLatestFromBuffer()
+			if latest != nil {
+				if strings.ToLower(latest.State) == "charging" && latest.Percentage >= 100 {
+					log.Println("🔋 Батарея полностью заряжена, замедляем сбор данных")
+					ticker.Reset(5 * time.Minute)
+				} else if strings.ToLower(latest.State) == "discharging" {
+					// Возвращаем нормальный интервал при разрядке
+					ticker.Reset(collector.pmsetInterval)
+				}
 			}
 		}
 	}
@@ -1317,39 +2324,173 @@ func printReport(db *sqlx.DB) error {
 
 // main – точка входа программы.
 func main() {
-	// Убираем флаги - программа работает автоматически
+	// Проверяем аргументы командной строки для обратной совместимости
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-help", "--help", "help":
+			showHelp()
+			return
+		case "-export-md", "--export-md":
+			if len(os.Args) < 3 {
+				color.New(color.FgRed).Println("❌ Укажите имя файла для экспорта")
+				return
+			}
+			if err := runExportMode(os.Args[2], "", true); err != nil {
+				log.Fatalf("❌ Ошибка экспорта: %v", err)
+			}
+			return
+		case "-export-html", "--export-html":
+			if len(os.Args) < 3 {
+				color.New(color.FgRed).Println("❌ Укажите имя файла для экспорта")
+				return
+			}
+			if err := runExportMode("", os.Args[2], true); err != nil {
+				log.Fatalf("❌ Ошибка экспорта: %v", err)
+			}
+			return
+		}
+	}
+
+	// Основной интерактивный режим
+	for {
+		if err := showMainMenu(); err != nil {
+			color.New(color.FgRed).Printf("❌ Ошибка: %v\n", err)
+			color.New(color.FgWhite).Print("Нажмите Enter для продолжения...")
+			fmt.Scanln()
+			continue
+		}
+		break
+	}
+}
+
+// showMainMenu отображает главное меню и обрабатывает выбор пользователя
+func showMainMenu() error {
+	for {
+		// Очищаем экран и показываем заголовок
+		fmt.Print("\033[2J\033[H") // Очистка экрана
+
+		color.New(color.FgCyan, color.Bold).Println("🔋 BatMon v2.0 - Мониторинг батареи MacBook")
+		color.New(color.FgWhite).Println("═══════════════════════════════════════════════════════")
+		fmt.Println()
+
+		// Показываем текущее состояние батареи
+		if err := showQuickStatus(); err != nil {
+			color.New(color.FgYellow).Printf("⚠️ Не удалось получить текущий статус: %v\n\n", err)
+		}
+
+		// Главное меню
+		color.New(color.FgGreen, color.Bold).Println("📋 Выберите действие:")
+		fmt.Println()
+		fmt.Println("  1️⃣  Запустить интерактивный мониторинг")
+		fmt.Println("  2️⃣  Показать детальный отчет")
+		fmt.Println("  3️⃣  Экспортировать отчеты")
+		fmt.Println("  4️⃣  Статистика и настройки")
+		fmt.Println("  5️⃣  Справка")
+		fmt.Println("  0️⃣  Выход")
+		fmt.Println()
+
+		color.New(color.FgWhite).Print("Ваш выбор (0-5): ")
+
+		var choice string
+		fmt.Scanln(&choice)
+
+		switch choice {
+		case "1":
+			return runMonitoringMode()
+		case "2":
+			return runReportMode()
+		case "3":
+			return runExportMenu()
+		case "4":
+			return runSettingsMenu()
+		case "5":
+			showHelp()
+		case "0", "q", "exit":
+			color.New(color.FgGreen).Println("\n👋 До свидания!")
+			return nil
+		default:
+			color.New(color.FgRed).Println("\n❌ Неверный выбор. Нажмите Enter для продолжения...")
+			fmt.Scanln()
+		}
+	}
+}
+
+// showQuickStatus показывает краткий статус батареи
+func showQuickStatus() error {
+	pct, state, err := parsePMSet()
+	if err != nil {
+		return fmt.Errorf("получение статуса: %w", err)
+	}
+
+	// Определяем цвет для процента заряда
+	var percentColor *color.Color
+	if pct >= 50 {
+		percentColor = color.New(color.FgGreen, color.Bold)
+	} else if pct >= 20 {
+		percentColor = color.New(color.FgYellow, color.Bold)
+	} else {
+		percentColor = color.New(color.FgRed, color.Bold)
+	}
+
+	// Форматируем статус
+	stateFormatted := formatStateWithEmoji(state, pct)
+
+	color.New(color.FgWhite).Print("💡 Текущий статус: ")
+	percentColor.Printf("%d%% ", pct)
+	color.New(color.FgCyan).Printf("(%s)", stateFormatted)
+
+	// Добавляем информацию о режиме питания
+	if strings.ToLower(state) == "charging" {
+		color.New(color.FgBlue).Print(" 🔌 На зарядке")
+	} else if strings.ToLower(state) == "discharging" {
+		color.New(color.FgMagenta).Print(" 🔋 От батареи")
+	} else {
+		color.New(color.FgGreen).Print(" ✅ Заряжена")
+	}
+
+	fmt.Println()
+	fmt.Println()
+
+	return nil
+}
+
+// runMonitoringMode запускает интерактивный мониторинг
+func runMonitoringMode() error {
+	color.New(color.FgGreen).Println("🔄 Запуск интерактивного мониторинга...")
+	fmt.Println("💡 Программа определит режим работы автоматически")
+	fmt.Println()
+
+	// Инициализируем БД
 	db, err := initDB(dbFile)
 	if err != nil {
-		log.Fatalf("инициализация БД: %v", err)
+		return fmt.Errorf("инициализация БД: %w", err)
 	}
 	defer db.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Обработка сигналов
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		fmt.Println("\nПолучен сигнал завершения. Завершаю...")
+		color.New(color.FgYellow).Println("\n⏹️ Получен сигнал завершения...")
 		cancel()
 	}()
 
-	// Проверяем текущее состояние питания
+	// Проверяем состояние питания
 	onBattery, state, percentage, err := isOnBattery()
 	if err != nil {
-		log.Printf("Ошибка определения состояния питания: %v", err)
-		// Продолжаем работу, показываем что есть в базе
-		if err := printReport(db); err != nil {
-			log.Fatalf("вывод отчёта: %v", err)
-		}
-		return
+		color.New(color.FgYellow).Printf("⚠️ Ошибка определения питания: %v\n", err)
+		return runReportMode() // Показываем отчет по имеющимся данным
 	}
 
-	fmt.Printf("⚡ Состояние питания: %s (%d%%)\n", formatStateWithEmoji(state, percentage), percentage)
+	color.New(color.FgCyan).Printf("⚡ Состояние питания: %s (%d%%)\n",
+		formatStateWithEmoji(state, percentage), percentage)
 
 	if onBattery {
-		fmt.Println("Компьютер работает от батареи - запускаю мониторинг и дашборд...")
+		color.New(color.FgBlue).Println("🔋 Работа от батареи - запуск мониторинга и дашборда...")
 
 		// Запускаем сбор данных в фоне
 		var wg sync.WaitGroup
@@ -1364,16 +2505,381 @@ func main() {
 			log.Printf("дашборд: %v", err)
 		}
 
-		// Ждем завершения фонового процесса
 		cancel()
 		wg.Wait()
-
 	} else {
-		fmt.Println("Компьютер работает от сети - показываю сохраненные данные...")
+		color.New(color.FgGreen).Println("🔌 Работа от сети - показ сохраненных данных...")
+		return runReportMode()
+	}
 
-		// Просто показываем отчет по имеющимся данным
-		if err := printReport(db); err != nil {
-			log.Fatalf("вывод отчёта: %v", err)
+	return nil
+}
+
+// runReportMode показывает детальный отчет
+func runReportMode() error {
+	color.New(color.FgBlue).Println("📊 Загрузка детального отчета...")
+
+	db, err := initDB(dbFile)
+	if err != nil {
+		return fmt.Errorf("инициализация БД: %w", err)
+	}
+	defer db.Close()
+
+	if err := printReport(db); err != nil {
+		return fmt.Errorf("вывод отчёта: %w", err)
+	}
+
+	color.New(color.FgWhite).Print("\nНажмите Enter для возврата в меню...")
+	fmt.Scanln()
+
+	return nil
+}
+
+// runExportMenu показывает меню экспорта
+func runExportMenu() error {
+	for {
+		fmt.Print("\033[2J\033[H") // Очистка экрана
+
+		color.New(color.FgCyan, color.Bold).Println("📄 Экспорт отчетов")
+		color.New(color.FgWhite).Println("═══════════════════════════════")
+		fmt.Println()
+
+		fmt.Println("  1️⃣  Экспорт в Markdown (.md)")
+		fmt.Println("  2️⃣  Экспорт в HTML (.html)")
+		fmt.Println("  3️⃣  Экспорт в оба формата")
+		fmt.Println("  0️⃣  Назад в главное меню")
+		fmt.Println()
+
+		color.New(color.FgWhite).Print("Выберите формат (0-3): ")
+
+		var choice string
+		fmt.Scanln(&choice)
+
+		switch choice {
+		case "1":
+			return handleExport("md")
+		case "2":
+			return handleExport("html")
+		case "3":
+			return handleExport("both")
+		case "0", "back":
+			return nil
+		default:
+			color.New(color.FgRed).Println("\n❌ Неверный выбор. Нажмите Enter для продолжения...")
+			fmt.Scanln()
 		}
 	}
+}
+
+// handleExport обрабатывает экспорт в выбранном формате
+func handleExport(format string) error {
+	color.New(color.FgWhite).Print("📝 Введите имя файла (без расширения): ")
+	var filename string
+	fmt.Scanln(&filename)
+
+	if filename == "" {
+		filename = fmt.Sprintf("battery_report_%s", time.Now().Format("20060102_150405"))
+		color.New(color.FgCyan).Printf("💡 Используется имя по умолчанию: %s\n", filename)
+	}
+
+	var markdownFile, htmlFile string
+
+	switch format {
+	case "md":
+		markdownFile = filename
+	case "html":
+		htmlFile = filename
+	case "both":
+		markdownFile = filename
+		htmlFile = filename
+	}
+
+	fmt.Println()
+	color.New(color.FgBlue).Println("📊 Генерация отчета...")
+
+	err := runExportMode(markdownFile, htmlFile, false)
+	if err != nil {
+		color.New(color.FgRed).Printf("❌ Ошибка экспорта: %v\n", err)
+	} else {
+		color.New(color.FgGreen).Println("✅ Экспорт выполнен успешно!")
+	}
+
+	color.New(color.FgWhite).Print("\nНажмите Enter для продолжения...")
+	fmt.Scanln()
+
+	return err
+}
+
+// runSettingsMenu показывает меню настроек и статистики
+func runSettingsMenu() error {
+	for {
+		fmt.Print("\033[2J\033[H") // Очистка экрана
+
+		color.New(color.FgCyan, color.Bold).Println("⚙️ Статистика и настройки")
+		color.New(color.FgWhite).Println("═══════════════════════════════")
+		fmt.Println()
+
+		// Показываем статистику БД
+		if err := showDatabaseStats(); err != nil {
+			color.New(color.FgRed).Printf("❌ Ошибка получения статистики: %v\n", err)
+		}
+
+		fmt.Println()
+		fmt.Println("  1️⃣  Показать расширенные метрики")
+		fmt.Println("  2️⃣  Очистить старые данные")
+		fmt.Println("  3️⃣  Информация о системе")
+		fmt.Println("  0️⃣  Назад в главное меню")
+		fmt.Println()
+
+		color.New(color.FgWhite).Print("Ваш выбор (0-3): ")
+
+		var choice string
+		fmt.Scanln(&choice)
+
+		switch choice {
+		case "1":
+			return showAdvancedMetrics()
+		case "2":
+			return cleanupOldData()
+		case "3":
+			return showSystemInfo()
+		case "0", "back":
+			return nil
+		default:
+			color.New(color.FgRed).Println("\n❌ Неверный выбор. Нажмите Enter для продолжения...")
+			fmt.Scanln()
+		}
+	}
+}
+
+// showDatabaseStats показывает статистику базы данных
+func showDatabaseStats() error {
+	db, err := initDB(dbFile)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	collector := NewDataCollector(db)
+	stats, err := collector.GetStats()
+	if err != nil {
+		return err
+	}
+
+	color.New(color.FgGreen).Println("📊 Статистика данных:")
+	fmt.Printf("   📦 Записей в БД: %v\n", stats["total_records"])
+	fmt.Printf("   💾 Размер БД: %.1f МБ\n", stats["db_size_mb"])
+	fmt.Printf("   🗄️ Буфер памяти: %v/%v записей\n", stats["buffer_size"], stats["buffer_max_size"])
+
+	if oldest, ok := stats["oldest_record"].(string); ok && oldest != "" {
+		color.New(color.FgCyan).Printf("   📅 Самая старая запись: %s\n", oldest)
+	}
+	if newest, ok := stats["newest_record"].(string); ok && newest != "" {
+		color.New(color.FgCyan).Printf("   📅 Самая новая запись: %s\n", newest)
+	}
+
+	return nil
+}
+
+// showAdvancedMetrics показывает расширенные метрики
+func showAdvancedMetrics() error {
+	color.New(color.FgBlue).Println("🔬 Загрузка расширенных метрик...")
+
+	db, err := initDB(dbFile)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	measurements, err := getLastNMeasurements(db, 50)
+	if err != nil {
+		return fmt.Errorf("получение данных: %w", err)
+	}
+
+	if len(measurements) == 0 {
+		color.New(color.FgYellow).Println("⚠️ Недостаточно данных для анализа")
+		color.New(color.FgWhite).Print("Нажмите Enter для продолжения...")
+		fmt.Scanln()
+		return nil
+	}
+
+	metrics := analyzeAdvancedMetrics(measurements)
+
+	fmt.Println()
+	color.New(color.FgGreen, color.Bold).Println("🔬 Расширенные метрики:")
+	color.New(color.FgWhite).Println("═══════════════════════════════")
+
+	fmt.Printf("⚡ Энергоэффективность: %.1f%%\n", metrics.PowerEfficiency)
+	fmt.Printf("🔧 Стабильность напряжения: %.1f%%\n", metrics.VoltageStability)
+	fmt.Printf("🔋 Эффективность зарядки: %.2f\n", metrics.ChargingEfficiency)
+	fmt.Printf("📊 Тренд мощности: %s\n", metrics.PowerTrend)
+	fmt.Printf("🏆 Рейтинг здоровья: %d/100\n", metrics.HealthRating)
+	fmt.Printf("🍎 Статус Apple: %s\n", metrics.AppleStatus)
+
+	fmt.Println()
+	color.New(color.FgWhite).Print("Нажмите Enter для продолжения...")
+	fmt.Scanln()
+
+	return nil
+}
+
+// cleanupOldData выполняет очистку старых данных
+func cleanupOldData() error {
+	color.New(color.FgYellow).Println("🧹 Очистка старых данных...")
+
+	db, err := initDB(dbFile)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	retention := NewDataRetention(db, 90*24*time.Hour) // 3 месяца
+
+	if err := retention.Cleanup(); err != nil {
+		color.New(color.FgRed).Printf("❌ Ошибка очистки: %v\n", err)
+	} else {
+		color.New(color.FgGreen).Println("✅ Очистка выполнена успешно")
+	}
+
+	color.New(color.FgWhite).Print("Нажмите Enter для продолжения...")
+	fmt.Scanln()
+
+	return nil
+}
+
+// showSystemInfo показывает информацию о системе
+func showSystemInfo() error {
+	color.New(color.FgGreen, color.Bold).Println("💻 Информация о системе:")
+	color.New(color.FgWhite).Println("═══════════════════════════════")
+
+	// Информация о версии Go
+	fmt.Printf("🔧 Версия Go: %s\n", "1.24+")
+	fmt.Printf("💾 База данных: SQLite с WAL режимом\n")
+	fmt.Printf("📁 Файл БД: %s\n", dbFile)
+
+	// Проверяем доступность команд
+	if _, err := exec.LookPath("pmset"); err == nil {
+		color.New(color.FgGreen).Println("✅ pmset доступен")
+	} else {
+		color.New(color.FgRed).Println("❌ pmset недоступен")
+	}
+
+	if _, err := exec.LookPath("system_profiler"); err == nil {
+		color.New(color.FgGreen).Println("✅ system_profiler доступен")
+	} else {
+		color.New(color.FgRed).Println("❌ system_profiler недоступен")
+	}
+
+	fmt.Println()
+	color.New(color.FgWhite).Print("Нажмите Enter для продолжения...")
+	fmt.Scanln()
+
+	return nil
+}
+
+// showHelp показывает справочную информацию
+func showHelp() {
+	fmt.Print("\033[2J\033[H") // Очистка экрана
+
+	color.New(color.FgCyan, color.Bold).Println("❓ Справка BatMon v2.0")
+	color.New(color.FgWhite).Println("═══════════════════════════════")
+	fmt.Println()
+
+	color.New(color.FgGreen).Println("🔋 О программе:")
+	fmt.Println("BatMon - это продвинутая утилита для мониторинга состояния батареи MacBook.")
+	fmt.Println("Поддерживает интерактивный мониторинг, детальную аналитику и экспорт отчетов.")
+	fmt.Println()
+
+	color.New(color.FgYellow).Println("📊 Возможности:")
+	fmt.Println("• Интерактивный дашборд с графиками")
+	fmt.Println("• Анализ трендов и прогноз деградации")
+	fmt.Println("• Мониторинг температуры и расширенных метрик")
+	fmt.Println("• Экспорт в Markdown и HTML форматы")
+	fmt.Println("• Автоматическая ретенция данных")
+	fmt.Println("• Цветной вывод и эмодзи индикаторы")
+	fmt.Println()
+
+	color.New(color.FgBlue).Println("🎯 Режимы работы:")
+	fmt.Println("1. Интерактивный мониторинг - при работе от батареи")
+	fmt.Println("2. Детальный отчет - анализ сохраненных данных")
+	fmt.Println("3. Экспорт отчетов - сохранение в файлы")
+	fmt.Println("4. Статистика - информация о данных и системе")
+	fmt.Println()
+
+	color.New(color.FgMagenta).Println("🔧 Требования:")
+	fmt.Println("• macOS (протестировано на Apple Silicon)")
+	fmt.Println("• Go 1.24+ для сборки из исходников")
+	fmt.Println("• MacBook с батареей")
+	fmt.Println()
+
+	color.New(color.FgRed).Println("🆘 Поддержка:")
+	fmt.Println("• GitHub: https://github.com/region23/batmon")
+	fmt.Println("• Issues: сообщайте о проблемах через GitHub Issues")
+	fmt.Println()
+
+	color.New(color.FgWhite).Print("Нажмите Enter для возврата в меню...")
+	fmt.Scanln()
+}
+
+// runExportMode выполняет экспорт отчетов
+func runExportMode(markdownFile, htmlFile string, quiet bool) error {
+	if !quiet {
+		fmt.Println("🔋 Batmon - Экспорт отчетов")
+	}
+
+	db, err := initDB(dbFile)
+	if err != nil {
+		return fmt.Errorf("инициализация БД: %w", err)
+	}
+	defer db.Close()
+
+	// Генерируем данные для отчета
+	data, err := generateReportData(db)
+	if err != nil {
+		return fmt.Errorf("генерация данных отчета: %w", err)
+	}
+
+	var exported []string
+
+	// Экспорт в Markdown
+	if markdownFile != "" {
+		if !strings.HasSuffix(markdownFile, ".md") {
+			markdownFile += ".md"
+		}
+
+		if !quiet {
+			fmt.Printf("📝 Экспортирую отчет в Markdown: %s\n", markdownFile)
+		}
+
+		if err := exportToMarkdown(data, markdownFile); err != nil {
+			return fmt.Errorf("экспорт в Markdown: %w", err)
+		}
+		exported = append(exported, markdownFile)
+	}
+
+	// Экспорт в HTML
+	if htmlFile != "" {
+		if !strings.HasSuffix(htmlFile, ".html") && !strings.HasSuffix(htmlFile, ".htm") {
+			htmlFile += ".html"
+		}
+
+		if !quiet {
+			fmt.Printf("🌐 Экспортирую отчет в HTML: %s\n", htmlFile)
+		}
+
+		if err := exportToHTML(data, htmlFile); err != nil {
+			return fmt.Errorf("экспорт в HTML: %w", err)
+		}
+		exported = append(exported, htmlFile)
+	}
+
+	if !quiet && len(exported) > 0 {
+		fmt.Printf("✅ Экспорт завершен! Созданы файлы:\n")
+		for _, file := range exported {
+			absPath, _ := filepath.Abs(file)
+			fmt.Printf("   - %s\n", absPath)
+		}
+	}
+
+	return nil
 }
