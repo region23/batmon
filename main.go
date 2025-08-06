@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fatih/color"
 	ui "github.com/gizak/termui/v3"
 	"github.com/gizak/termui/v3/widgets"
 	"github.com/jmoiron/sqlx"
@@ -28,9 +29,34 @@ import (
 )
 
 const (
-	dbFile   = "batmon.sqlite" // имя файла SQLite
-	interval = 30 * time.Second
+	dbFile           = "batmon.sqlite"  // имя файла SQLite
+	pmsetInterval    = 30 * time.Second // интервал опроса pmset
+	profilerInterval = 2 * time.Minute  // интервал опроса system_profiler
 )
+
+// TrendAnalysis содержит результат анализа тренда
+type TrendAnalysis struct {
+	DegradationRate   float64 // процент деградации в месяц
+	ProjectedLifetime int     // прогноз в днях до 80% емкости
+	IsHealthy         bool    // соответствует ли деградация норме
+}
+
+// ChargeCycle представляет цикл заряда-разряда
+type ChargeCycle struct {
+	StartTime    time.Time
+	EndTime      time.Time
+	StartPercent int
+	EndPercent   int
+	CycleType    string // "discharge", "charge", "full_cycle"
+	CapacityLoss int    // потеря емкости за цикл
+}
+
+// DataCollector управляет оптимизированным сбором данных
+type DataCollector struct {
+	lastProfilerCall time.Time
+	pmsetInterval    time.Duration
+	profilerInterval time.Duration
+}
 
 // Measurement – запись о состоянии батареи.
 type Measurement struct {
@@ -42,6 +68,7 @@ type Measurement struct {
 	FullChargeCap   int    `db:"full_charge_capacity"`
 	DesignCapacity  int    `db:"design_capacity"`
 	CurrentCapacity int    `db:"current_capacity"`
+	Temperature     int    `db:"temperature"` // температура батареи в °C
 }
 
 // initDB открывает соединение с SQLite и создаёт таблицу, если её нет.
@@ -50,6 +77,12 @@ func initDB(path string) (*sqlx.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("соединение с БД: %w", err)
 	}
+
+	// Включаем WAL режим для устранения блокировок при одновременном чтении/записи
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		log.Printf("предупреждение: не удалось включить WAL режим: %v", err)
+	}
+
 	schema := `CREATE TABLE IF NOT EXISTS measurements (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		timestamp TEXT NOT NULL,
@@ -58,7 +91,8 @@ func initDB(path string) (*sqlx.DB, error) {
 		cycle_count INTEGER,
 		full_charge_capacity INTEGER,
 		design_capacity INTEGER,
-		current_capacity INTEGER
+		current_capacity INTEGER,
+		temperature INTEGER DEFAULT 0
 	);`
 	if _, err = db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("создание таблицы: %w", err)
@@ -91,14 +125,14 @@ func parsePMSet() (int, string, error) {
 }
 
 // parseSystemProfiler получает данные из system_profiler.
-func parseSystemProfiler() (int, int, int, int, error) {
+func parseSystemProfiler() (int, int, int, int, int, error) {
 	cmd := exec.Command("system_profiler", "SPPowerDataType", "-detailLevel", "full")
 	out, err := cmd.Output()
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("system_profiler: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("system_profiler: %w", err)
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(out))
-	var cycle, fullCap, designCap, currCap int
+	var cycle, fullCap, designCap, currCap, temperature int
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		switch {
@@ -114,12 +148,17 @@ func parseSystemProfiler() (int, int, int, int, error) {
 		case strings.HasPrefix(line, "Current Capacity:"):
 			val := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "Current Capacity:")))[0]
 			currCap, _ = strconv.Atoi(val)
+		case strings.HasPrefix(line, "Temperature:"):
+			val := strings.TrimSpace(strings.TrimPrefix(line, "Temperature:"))
+			// Удаляем " C" в конце и конвертируем в целое число
+			val = strings.Replace(val, " C", "", -1)
+			temperature, _ = strconv.Atoi(val)
 		}
 	}
 	if err = scanner.Err(); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("сканирование system_profiler: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("сканирование system_profiler: %w", err)
 	}
-	return cycle, fullCap, designCap, currCap, nil
+	return cycle, fullCap, designCap, currCap, temperature, nil
 }
 
 // getMeasurement собирает все данные о батарее и возвращает Measurement.
@@ -128,7 +167,7 @@ func getMeasurement() (*Measurement, error) {
 	if pmErr != nil {
 		log.Printf("pmset: %v", pmErr)
 	}
-	cycle, fullCap, designCap, currCap, spErr := parseSystemProfiler()
+	cycle, fullCap, designCap, currCap, temperature, spErr := parseSystemProfiler()
 	if spErr != nil {
 		log.Printf("system_profiler: %v", spErr)
 	}
@@ -141,6 +180,7 @@ func getMeasurement() (*Measurement, error) {
 		FullChargeCap:   fullCap,
 		DesignCapacity:  designCap,
 		CurrentCapacity: currCap,
+		Temperature:     temperature,
 	}, nil
 }
 
@@ -148,11 +188,11 @@ func getMeasurement() (*Measurement, error) {
 func insertMeasurement(db *sqlx.DB, m *Measurement) error {
 	query := `INSERT INTO measurements (
 		timestamp, percentage, state, cycle_count,
-		full_charge_capacity, design_capacity, current_capacity)
-	VALUES (?, ?, ?, ?, ?, ?, ?)`
+		full_charge_capacity, design_capacity, current_capacity, temperature)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 	_, err := db.Exec(query,
 		m.Timestamp, m.Percentage, m.State, m.CycleCount,
-		m.FullChargeCap, m.DesignCapacity, m.CurrentCapacity)
+		m.FullChargeCap, m.DesignCapacity, m.CurrentCapacity, m.Temperature)
 	return err
 }
 
@@ -218,7 +258,7 @@ func computeWear(designCap, fullCap int) float64 {
 	return float64(designCap-fullCap) / float64(designCap) * 100.0
 }
 
-// detectBatteryAnomalies анализирует аномальные изменения заряда
+// detectBatteryAnomalies анализирует аномальные изменения заряда с нормализованными порогами
 func detectBatteryAnomalies(ms []Measurement) []string {
 	if len(ms) < 2 {
 		return nil
@@ -230,17 +270,28 @@ func detectBatteryAnomalies(ms []Measurement) []string {
 		prev := ms[i]
 		curr := ms[i+1]
 
-		// Резкий скачок заряда (больше 20% за один интервал)
-		chargeDiff := curr.Percentage - prev.Percentage
-		if chargeDiff > 20 {
-			anomalies = append(anomalies, fmt.Sprintf("Резкий рост заряда: %d%% → %d%% (%s)",
-				prev.Percentage, curr.Percentage, curr.Timestamp[11:19]))
+		// Вычисляем интервал времени между измерениями
+		prevTime, err1 := time.Parse(time.RFC3339, prev.Timestamp)
+		currTime, err2 := time.Parse(time.RFC3339, curr.Timestamp)
+		var interval time.Duration = 30 * time.Second // по умолчанию
+		if err1 == nil && err2 == nil {
+			interval = currTime.Sub(prevTime)
 		}
 
-		// Резкое падение заряда (больше 20% за один интервал)
-		if chargeDiff < -20 {
-			anomalies = append(anomalies, fmt.Sprintf("Резкое падение заряда: %d%% → %d%% (%s)",
-				prev.Percentage, curr.Percentage, curr.Timestamp[11:19]))
+		// Получаем нормализованные пороги
+		chargeThreshold, capacityThreshold := normalizeAnomalyThresholds(interval)
+
+		// Резкий скачок заряда
+		chargeDiff := curr.Percentage - prev.Percentage
+		if chargeDiff > chargeThreshold {
+			anomalies = append(anomalies, fmt.Sprintf("Резкий рост заряда: %d%% → %d%% за %.1f мин (%s)",
+				prev.Percentage, curr.Percentage, interval.Minutes(), curr.Timestamp[11:19]))
+		}
+
+		// Резкое падение заряда
+		if chargeDiff < -chargeThreshold {
+			anomalies = append(anomalies, fmt.Sprintf("Резкое падение заряда: %d%% → %d%% за %.1f мин (%s)",
+				prev.Percentage, curr.Percentage, interval.Minutes(), curr.Timestamp[11:19]))
 		}
 
 		// Неожиданное изменение состояния
@@ -249,11 +300,11 @@ func detectBatteryAnomalies(ms []Measurement) []string {
 				prev.State, curr.State, curr.Timestamp[11:19]))
 		}
 
-		// Резкое изменение емкости (больше 500 мАч)
+		// Резкое изменение емкости
 		capacityDiff := abs(curr.CurrentCapacity - prev.CurrentCapacity)
-		if capacityDiff > 500 {
-			anomalies = append(anomalies, fmt.Sprintf("Резкое изменение емкости: %d → %d мАч (%s)",
-				prev.CurrentCapacity, curr.CurrentCapacity, curr.Timestamp[11:19]))
+		if capacityDiff > capacityThreshold {
+			anomalies = append(anomalies, fmt.Sprintf("Резкое изменение емкости: %d → %d мАч за %.1f мин (%s)",
+				prev.CurrentCapacity, curr.CurrentCapacity, interval.Minutes(), curr.Timestamp[11:19]))
 		}
 	}
 
@@ -321,6 +372,222 @@ func abs(x int) int {
 	return x
 }
 
+// min возвращает минимальное значение
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// analyzeCapacityTrend анализирует тренд деградации батареи
+func analyzeCapacityTrend(measurements []Measurement) TrendAnalysis {
+	if len(measurements) < 10 {
+		return TrendAnalysis{IsHealthy: true} // Недостаточно данных для анализа
+	}
+
+	// Ищем измерения за последние 30 дней с system_profiler данными
+	now := time.Now()
+	thirtyDaysAgo := now.AddDate(0, 0, -30)
+
+	var validMeasurements []Measurement
+	for _, m := range measurements {
+		if t, err := time.Parse(time.RFC3339, m.Timestamp); err == nil {
+			if t.After(thirtyDaysAgo) && m.FullChargeCap > 0 && m.DesignCapacity > 0 {
+				validMeasurements = append(validMeasurements, m)
+			}
+		}
+	}
+
+	if len(validMeasurements) < 5 {
+		return TrendAnalysis{IsHealthy: true} // Недостаточно данных
+	}
+
+	// Простая линейная регрессия для тренда емкости
+	first := validMeasurements[0]
+	last := validMeasurements[len(validMeasurements)-1]
+
+	firstTime, _ := time.Parse(time.RFC3339, first.Timestamp)
+	lastTime, _ := time.Parse(time.RFC3339, last.Timestamp)
+
+	daysDiff := lastTime.Sub(firstTime).Hours() / 24
+	if daysDiff < 7 { // Менее недели данных
+		return TrendAnalysis{IsHealthy: true}
+	}
+
+	capacityDiff := float64(last.FullChargeCap - first.FullChargeCap)
+	dailyDegradation := capacityDiff / daysDiff
+	monthlyDegradation := dailyDegradation * 30
+
+	// Рассчитываем процент деградации от проектной емкости
+	monthlyDegradationPercent := (monthlyDegradation / float64(last.DesignCapacity)) * 100
+
+	// Прогноз времени до 80% емкости
+	currentHealthPercent := (float64(last.FullChargeCap) / float64(last.DesignCapacity)) * 100
+	targetHealthPercent := 80.0
+
+	var projectedDays int
+	if monthlyDegradationPercent < 0 && currentHealthPercent > targetHealthPercent {
+		monthsTo80Percent := (currentHealthPercent - targetHealthPercent) / (-monthlyDegradationPercent)
+		projectedDays = int(monthsTo80Percent * 30)
+	}
+
+	// Считаем здоровой деградацию менее 0.5% в месяц
+	isHealthy := monthlyDegradationPercent > -0.5
+
+	return TrendAnalysis{
+		DegradationRate:   monthlyDegradationPercent,
+		ProjectedLifetime: projectedDays,
+		IsHealthy:         isHealthy,
+	}
+}
+
+// detectChargeCycles обнаруживает циклы заряда-разряда
+func detectChargeCycles(measurements []Measurement) []ChargeCycle {
+	if len(measurements) < 3 {
+		return nil
+	}
+
+	var cycles []ChargeCycle
+	var currentCycle *ChargeCycle
+
+	for i, m := range measurements {
+		timestamp, err := time.Parse(time.RFC3339, m.Timestamp)
+		if err != nil {
+			continue
+		}
+
+		if i == 0 {
+			continue // Пропускаем первое измерение
+		}
+
+		prev := measurements[i-1]
+
+		// Определяем смену направления (заряд/разряд)
+		if prev.State != m.State {
+			if currentCycle != nil {
+				// Завершаем текущий цикл
+				currentCycle.EndTime = timestamp
+				currentCycle.EndPercent = m.Percentage
+
+				if prev.CurrentCapacity > 0 && m.CurrentCapacity > 0 {
+					currentCycle.CapacityLoss = prev.CurrentCapacity - m.CurrentCapacity
+				}
+
+				cycles = append(cycles, *currentCycle)
+			}
+
+			// Начинаем новый цикл
+			currentCycle = &ChargeCycle{
+				StartTime:    timestamp,
+				StartPercent: m.Percentage,
+				CycleType:    strings.ToLower(m.State),
+			}
+		}
+
+		// Обновляем текущий цикл
+		if currentCycle != nil {
+			currentCycle.EndTime = timestamp
+			currentCycle.EndPercent = m.Percentage
+		}
+	}
+
+	// Завершаем последний цикл если есть
+	if currentCycle != nil {
+		cycles = append(cycles, *currentCycle)
+	}
+
+	return cycles
+}
+
+// normalizeAnomalyThresholds нормализует пороги аномалий на время
+func normalizeAnomalyThresholds(interval time.Duration) (int, int) {
+	// Базовые пороги для 30-секундного интервала
+	baseChargeThreshold := 20    // процентов
+	baseCapacityThreshold := 500 // мАч
+
+	// Нормализация на минуту
+	minutes := interval.Minutes()
+	if minutes < 0.5 {
+		minutes = 0.5 // минимум 30 секунд
+	}
+
+	// Чем больше интервал, тем выше допустимые пороги
+	normalizedChargeThreshold := int(float64(baseChargeThreshold) * minutes * 2) // 40% в минуту
+	normalizedCapacityThreshold := int(float64(baseCapacityThreshold) * minutes)
+
+	// Ограничиваем максимальные пороги
+	if normalizedChargeThreshold > 50 {
+		normalizedChargeThreshold = 50
+	}
+	if normalizedCapacityThreshold > 2000 {
+		normalizedCapacityThreshold = 2000
+	}
+
+	return normalizedChargeThreshold, normalizedCapacityThreshold
+}
+
+// printColoredStatus выводит статус с цветовым оформлением
+func printColoredStatus(status string, value interface{}, level string) {
+	switch level {
+	case "critical":
+		color.Red("%s: %v", status, value)
+	case "warning":
+		color.Yellow("%s: %v", status, value)
+	case "good":
+		color.Green("%s: %v", status, value)
+	case "info":
+		color.Cyan("%s: %v", status, value)
+	default:
+		fmt.Printf("%s: %v\n", status, value)
+	}
+}
+
+// getStatusLevel определяет уровень важности для цветового оформления
+func getStatusLevel(wear float64, percentage int, temperature int, healthScore int) string {
+	if wear > 30 || percentage < 10 || temperature > 45 || healthScore < 40 {
+		return "critical"
+	}
+	if wear > 20 || percentage < 20 || temperature > 35 || healthScore < 70 {
+		return "warning"
+	}
+	if wear < 10 && percentage > 50 && temperature < 30 && healthScore > 85 {
+		return "good"
+	}
+	return "info"
+}
+
+// formatStateWithEmoji добавляет эмодзи к состоянию батареи
+func formatStateWithEmoji(state string, percentage int) string {
+	if state == "" {
+		return "Неизвестно"
+	}
+
+	stateLower := strings.ToLower(state)
+	stateFormatted := strings.ToUpper(string(stateLower[0])) + stateLower[1:]
+
+	switch stateLower {
+	case "charging":
+		if percentage >= 90 {
+			return "🔋 " + stateFormatted + " (почти полная)"
+		}
+		return "⚡ " + stateFormatted
+	case "discharging":
+		if percentage < 20 {
+			return "🪫 " + stateFormatted + " (низкий заряд)"
+		} else if percentage < 50 {
+			return "🔋 " + stateFormatted
+		}
+		return "🔋 " + stateFormatted
+	case "charged":
+		return "✅ " + stateFormatted
+	case "finishing":
+		return "🔌 " + stateFormatted
+	default:
+		return stateFormatted
+	}
+}
+
 // analyzeBatteryHealth анализирует общее состояние батареи
 func analyzeBatteryHealth(ms []Measurement) map[string]interface{} {
 	if len(ms) == 0 {
@@ -344,6 +611,14 @@ func analyzeBatteryHealth(ms []Measurement) map[string]interface{} {
 	avgRate, validIntervals := computeAvgRateRobust(ms, 10)
 	analysis["discharge_rate"] = avgRate
 	analysis["valid_intervals"] = validIntervals
+
+	// Анализ трендов
+	trendAnalysis := analyzeCapacityTrend(ms)
+	analysis["trend_analysis"] = trendAnalysis
+
+	// Анализ циклов заряда-разряда
+	chargeCycles := detectChargeCycles(ms)
+	analysis["charge_cycles"] = chargeCycles
 
 	// Оценка здоровья батареи
 	var healthStatus string
@@ -373,22 +648,58 @@ func analyzeBatteryHealth(ms []Measurement) map[string]interface{} {
 		healthStatus += " (нестабильная работа)"
 	}
 
+	// Корректировка на основе тренда
+	if !trendAnalysis.IsHealthy && trendAnalysis.DegradationRate < -1.0 {
+		healthScore -= 15
+		healthStatus += " (быстрая деградация)"
+	}
+
 	analysis["health_status"] = healthStatus
 	analysis["health_score"] = healthScore
 
-	// Рекомендации
+	// Расширенные рекомендации
 	var recommendations []string
+
+	// Рекомендации по замене
 	if wear > 20 {
 		recommendations = append(recommendations, "Рассмотрите замену батареи")
 	}
+
+	// Рекомендации по аномалиям
 	if len(anomalies) > 3 {
 		recommendations = append(recommendations, "Проверьте настройки энергосбережения")
 	}
+
+	// Рекомендации по циклам
 	if latest.CycleCount > 1000 {
 		recommendations = append(recommendations, "Батарея приближается к концу жизненного цикла")
 	}
+
+	// Рекомендации по энергопотреблению
 	if avgRate > 1000 {
 		recommendations = append(recommendations, "Высокое энергопотребление - закройте ресурсоемкие приложения")
+	}
+
+	// Рекомендации по температуре
+	if latest.Temperature > 40 {
+		recommendations = append(recommendations, "Высокая температура батареи ("+strconv.Itoa(latest.Temperature)+"°C) - избегайте нагрузки")
+	} else if latest.Temperature > 35 {
+		recommendations = append(recommendations, "Повышенная температура батареи - рассмотрите улучшение охлаждения")
+	}
+
+	// Рекомендации по трендам
+	if !trendAnalysis.IsHealthy && trendAnalysis.DegradationRate < -0.5 {
+		recommendations = append(recommendations, fmt.Sprintf("Быстрая деградация батареи (%.2f%% в месяц) - проверьте условия эксплуатации", -trendAnalysis.DegradationRate))
+	}
+
+	// Рекомендации по заряду
+	if latest.State == "charging" && latest.Percentage == 100 {
+		recommendations = append(recommendations, "Не держите батарею постоянно на 100% заряда")
+	}
+
+	// Рекомендации по калибровке
+	if wear > 15 && latest.CycleCount > 500 {
+		recommendations = append(recommendations, "Рассмотрите калибровку батареи (полный разряд и заряд)")
 	}
 
 	analysis["recommendations"] = recommendations
@@ -410,9 +721,14 @@ func isOnBattery() (bool, string, int, error) {
 	return isOnBatt, state, pct, nil
 }
 
-// backgroundDataCollection запускает сбор данных в фоне
+// backgroundDataCollection запускает сбор данных в фоне с оптимизацией частоты
 func backgroundDataCollection(db *sqlx.DB, ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
+
+	collector := &DataCollector{
+		pmsetInterval:    pmsetInterval,
+		profilerInterval: profilerInterval,
+	}
 
 	// Делаем первое измерение
 	meas, err := getMeasurement()
@@ -420,12 +736,13 @@ func backgroundDataCollection(db *sqlx.DB, ctx context.Context, wg *sync.WaitGro
 		log.Printf("первичное измерение: %v", err)
 		return
 	}
+	collector.lastProfilerCall = time.Now()
 
 	if err = insertMeasurement(db, meas); err != nil {
 		log.Printf("запись первой записи: %v", err)
 	}
 
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(collector.pmsetInterval)
 	defer ticker.Stop()
 
 	for {
@@ -433,7 +750,43 @@ func backgroundDataCollection(db *sqlx.DB, ctx context.Context, wg *sync.WaitGro
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m, err := getMeasurement()
+			// Определяем, нужно ли вызывать system_profiler
+			needProfiler := time.Since(collector.lastProfilerCall) >= collector.profilerInterval
+
+			var m *Measurement
+			if needProfiler {
+				// Полное измерение с system_profiler
+				m, err = getMeasurement()
+				collector.lastProfilerCall = time.Now()
+			} else {
+				// Только pmset для быстрого обновления процента заряда
+				pct, state, pmErr := parsePMSet()
+				if pmErr != nil {
+					log.Printf("pmset: %v", pmErr)
+					continue
+				}
+
+				// Используем последние известные данные для остальных полей
+				lastMs, dbErr := getLastNMeasurements(db, 1)
+				if dbErr != nil || len(lastMs) == 0 {
+					// Если нет предыдущих данных, делаем полное измерение
+					m, err = getMeasurement()
+					collector.lastProfilerCall = time.Now()
+				} else {
+					last := lastMs[0]
+					m = &Measurement{
+						Timestamp:       time.Now().UTC().Format(time.RFC3339),
+						Percentage:      pct,
+						State:           state,
+						CycleCount:      last.CycleCount,
+						FullChargeCap:   last.FullChargeCap,
+						DesignCapacity:  last.DesignCapacity,
+						CurrentCapacity: last.CurrentCapacity,
+						Temperature:     last.Temperature,
+					}
+				}
+			}
+
 			if err != nil {
 				log.Printf("измерение: %v", err)
 				continue
@@ -442,15 +795,13 @@ func backgroundDataCollection(db *sqlx.DB, ctx context.Context, wg *sync.WaitGro
 				log.Printf("запись измерения: %v", err)
 			}
 
-			// Если подключили зарядку или батарея села, можно остановить сбор
-			// Но для дашборда продолжаем работать
+			// Если подключили зарядку или батарея села, можно замедлить сбор
 			if strings.ToLower(m.State) == "charging" && m.Percentage >= 100 {
 				log.Println("Батарея полностью заряжена, замедляем сбор данных")
-				// Увеличиваем интервал при полной зарядке
 				ticker.Reset(5 * time.Minute)
 			} else if strings.ToLower(m.State) == "discharging" {
 				// Возвращаем нормальный интервал при разрядке
-				ticker.Reset(interval)
+				ticker.Reset(collector.pmsetInterval)
 			}
 		}
 	}
@@ -539,12 +890,23 @@ renderDashboard:
 	infoList := widgets.NewList()
 	infoList.Title = "Текущее состояние"
 	infoRows := []string{
-		fmt.Sprintf("Заряд: %d%%", latest.Percentage),
-		fmt.Sprintf("Состояние: %s", strings.Title(latest.State)),
-		fmt.Sprintf("Циклы: %d", latest.CycleCount),
-		fmt.Sprintf("Износ: %.1f%%", wear),
-		fmt.Sprintf("Скорость: %.2f мАч/ч", robustRate),
-		fmt.Sprintf("Время: %s", remaining.Truncate(time.Minute)),
+		fmt.Sprintf("🔋 Заряд: %d%%", latest.Percentage),
+		fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
+		fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
+		fmt.Sprintf("📉 Износ: %.1f%%", wear),
+		fmt.Sprintf("⏱️  Скорость: %.2f мАч/ч", robustRate),
+		fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
+	}
+
+	// Добавляем температуру если доступна
+	if latest.Temperature > 0 {
+		tempEmoji := "🌡️"
+		if latest.Temperature > 40 {
+			tempEmoji = "🔥"
+		} else if latest.Temperature < 20 {
+			tempEmoji = "❄️"
+		}
+		infoRows = append(infoRows, fmt.Sprintf("%s Температура: %d°C", tempEmoji, latest.Temperature))
 	}
 
 	if healthAnalysis != nil {
@@ -649,12 +1011,23 @@ renderDashboard:
 
 					// Обновляем информационный список
 					infoRows := []string{
-						fmt.Sprintf("Заряд: %d%%", latest.Percentage),
-						fmt.Sprintf("Состояние: %s", strings.Title(latest.State)),
-						fmt.Sprintf("Циклы: %d", latest.CycleCount),
-						fmt.Sprintf("Износ: %.1f%%", wear),
-						fmt.Sprintf("Скорость: %.2f мАч/ч", robustRate),
-						fmt.Sprintf("Время: %s", remaining.Truncate(time.Minute)),
+						fmt.Sprintf("🔋 Заряд: %d%%", latest.Percentage),
+						fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
+						fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
+						fmt.Sprintf("📉 Износ: %.1f%%", wear),
+						fmt.Sprintf("⏱️  Скорость: %.2f мАч/ч", robustRate),
+						fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
+					}
+
+					// Добавляем температуру если доступна
+					if latest.Temperature > 0 {
+						tempEmoji := "🌡️"
+						if latest.Temperature > 40 {
+							tempEmoji = "🔥"
+						} else if latest.Temperature < 20 {
+							tempEmoji = "❄️"
+						}
+						infoRows = append(infoRows, fmt.Sprintf("%s Температура: %d°C", tempEmoji, latest.Temperature))
 					}
 
 					if healthAnalysis != nil {
@@ -708,12 +1081,23 @@ renderDashboard:
 
 				// Обновляем информационный список
 				infoRows := []string{
-					fmt.Sprintf("Заряд: %d%%", latest.Percentage),
-					fmt.Sprintf("Состояние: %s", strings.Title(latest.State)),
-					fmt.Sprintf("Циклы: %d", latest.CycleCount),
-					fmt.Sprintf("Износ: %.1f%%", wear),
-					fmt.Sprintf("Скорость: %.2f мАч/ч", robustRate),
-					fmt.Sprintf("Время: %s", remaining.Truncate(time.Minute)),
+					fmt.Sprintf("🔋 Заряд: %d%%", latest.Percentage),
+					fmt.Sprintf("⚡ Состояние: %s", formatStateWithEmoji(latest.State, latest.Percentage)),
+					fmt.Sprintf("🔄 Циклы: %d", latest.CycleCount),
+					fmt.Sprintf("📉 Износ: %.1f%%", wear),
+					fmt.Sprintf("⏱️  Скорость: %.2f мАч/ч", robustRate),
+					fmt.Sprintf("⏰ Время: %s", remaining.Truncate(time.Minute)),
+				}
+
+				// Добавляем температуру если доступна
+				if latest.Temperature > 0 {
+					tempEmoji := "🌡️"
+					if latest.Temperature > 40 {
+						tempEmoji = "🔥"
+					} else if latest.Temperature < 20 {
+						tempEmoji = "❄️"
+					}
+					infoRows = append(infoRows, fmt.Sprintf("%s Температура: %d°C", tempEmoji, latest.Temperature))
 				}
 
 				if healthAnalysis != nil {
@@ -751,14 +1135,14 @@ renderDashboard:
 	}
 }
 
-// printReport выводит отчёт о последнем измерении и статистике.
+// printReport выводит отчёт о последнем измерении и статистике с цветным оформлением.
 func printReport(db *sqlx.DB) error {
 	ms, err := getLastNMeasurements(db, 20) // Увеличиваем количество для лучшего анализа
 	if err != nil {
 		return fmt.Errorf("получение исторических данных: %w", err)
 	}
 	if len(ms) == 0 {
-		fmt.Println("Нет записей для отчёта.")
+		color.Yellow("Нет записей для отчёта.")
 		return nil
 	}
 
@@ -771,62 +1155,134 @@ func printReport(db *sqlx.DB) error {
 	// Анализ здоровья батареи
 	healthAnalysis := analyzeBatteryHealth(ms)
 
-	fmt.Println("=== Текущее состояние батареи ===")
-	fmt.Printf("%s | %d%% | %s\n", latest.Timestamp, latest.Percentage, strings.Title(latest.State))
-	fmt.Printf("Состояние питания: %s\n", strings.Title(latest.State))
-	fmt.Printf("Кол-во циклов: %d\n", latest.CycleCount)
-	fmt.Printf("Полная ёмкость: %d мАч\n", latest.FullChargeCap)
-	fmt.Printf("Дизайнерская ёмкость: %d мАч\n", latest.DesignCapacity)
-	fmt.Printf("Текущая ёмкость: %d мАч\n", latest.CurrentCapacity)
-
-	fmt.Println("\n=== Анализ здоровья батареи ===")
+	// Определяем уровень для цветового оформления
+	healthScore := 70
 	if healthAnalysis != nil {
-		fmt.Printf("Общее состояние: %s (оценка: %d/100)\n",
-			healthAnalysis["health_status"], healthAnalysis["health_score"])
-		fmt.Printf("Износ батареи: %.1f%%\n", wear)
+		if score, ok := healthAnalysis["health_score"].(int); ok {
+			healthScore = score
+		}
+	}
+	statusLevel := getStatusLevel(wear, latest.Percentage, latest.Temperature, healthScore)
+
+	// Краткое резюме
+	color.Cyan("💼 === КРАТКОЕ РЕЗЮМЕ ===")
+	if healthAnalysis != nil {
+		if status, ok := healthAnalysis["health_status"].(string); ok {
+			score, _ := healthAnalysis["health_score"].(int)
+			printColoredStatus("Здоровье батареи", fmt.Sprintf("%s (рейтинг %d/100)", status, score), getStatusLevel(wear, 100, 25, score))
+		}
+	}
+	printColoredStatus("Циклы", fmt.Sprintf("%d", latest.CycleCount), statusLevel)
+	printColoredStatus("Износ", fmt.Sprintf("%.1f%%", wear), getStatusLevel(wear, 100, 25, 100))
+	if remaining > 0 {
+		printColoredStatus("Оставшееся время", remaining.Truncate(time.Minute).String(), statusLevel)
+	}
+	fmt.Println()
+
+	color.Cyan("=== Текущее состояние батареи ===")
+	localTime, _ := time.Parse(time.RFC3339, latest.Timestamp)
+	fmt.Printf("📅 %s | ", localTime.Format("15:04:05 02.01.2006"))
+	printColoredStatus("Заряд", fmt.Sprintf("%d%%", latest.Percentage), getStatusLevel(0, latest.Percentage, 25, 100))
+	fmt.Printf("⚡ %s\n", formatStateWithEmoji(latest.State, latest.Percentage))
+	fmt.Printf("🔄 Кол-во циклов: %d\n", latest.CycleCount)
+	fmt.Printf("⚡ Полная ёмкость: %d мАч\n", latest.FullChargeCap)
+	fmt.Printf("📐 Проектная ёмкость: %d мАч\n", latest.DesignCapacity)
+	fmt.Printf("🔋 Текущая ёмкость: %d мАч\n", latest.CurrentCapacity)
+
+	// Выводим температуру если доступна
+	if latest.Temperature > 0 {
+		tempLevel := "info"
+		if latest.Temperature > 40 {
+			tempLevel = "critical"
+		} else if latest.Temperature > 35 {
+			tempLevel = "warning"
+		}
+		printColoredStatus("🌡️  Температура", fmt.Sprintf("%d°C", latest.Temperature), tempLevel)
+	}
+
+	fmt.Println()
+	color.Cyan("=== Анализ здоровья батареи ===")
+	if healthAnalysis != nil {
+		if status, ok := healthAnalysis["health_status"].(string); ok {
+			score, _ := healthAnalysis["health_score"].(int)
+			printColoredStatus("Общее состояние", fmt.Sprintf("%s (оценка: %d/100)", status, score), getStatusLevel(wear, 100, 25, score))
+		}
+		printColoredStatus("Износ батареи", fmt.Sprintf("%.1f%%", wear), getStatusLevel(wear, 100, 25, 100))
+
+		// Анализ трендов
+		if trendAnalysis, ok := healthAnalysis["trend_analysis"].(TrendAnalysis); ok {
+			if trendAnalysis.DegradationRate != 0 {
+				trendLevel := "good"
+				if !trendAnalysis.IsHealthy {
+					trendLevel = "warning"
+				}
+				if trendAnalysis.DegradationRate < -1.0 {
+					trendLevel = "critical"
+				}
+				printColoredStatus("📈 Тренд деградации", fmt.Sprintf("%.2f%% в месяц", trendAnalysis.DegradationRate), trendLevel)
+
+				if trendAnalysis.ProjectedLifetime > 0 {
+					fmt.Printf("🔮 Прогноз до 80%% емкости: ~%d дней\n", trendAnalysis.ProjectedLifetime)
+				}
+			}
+		}
 
 		if anomalies, ok := healthAnalysis["anomalies"].([]string); ok && len(anomalies) > 0 {
-			fmt.Printf("\n⚠️  Обнаружено аномалий за последние измерения: %d\n", len(anomalies))
+			color.Yellow("\n⚠️  Обнаружено аномалий за последние измерения: %d", len(anomalies))
 			for i, anomaly := range anomalies {
 				if i >= 5 { // Показываем максимум 5 последних аномалий
-					fmt.Printf("... и еще %d\n", len(anomalies)-i)
+					color.Yellow("... и еще %d", len(anomalies)-i)
 					break
 				}
-				fmt.Printf("  • %s\n", anomaly)
+				color.Red("  • %s", anomaly)
 			}
 		}
 
 		if recs, ok := healthAnalysis["recommendations"].([]string); ok && len(recs) > 0 {
-			fmt.Println("\n💡 Рекомендации:")
+			color.Green("\n💡 Рекомендации:")
 			for _, rec := range recs {
-				fmt.Printf("  • %s\n", rec)
+				color.Green("  • %s", rec)
 			}
 		}
 	}
 
-	fmt.Println("\n=== Статистика разрядки ===")
+	fmt.Println()
+	color.Cyan("=== Статистика разрядки ===")
 	if avgRate > 0 {
-		fmt.Printf("Простая скорость разрядки: %.2f мАч/час\n", avgRate)
+		fmt.Printf("📊 Простая скорость разрядки: %.2f мАч/час\n", avgRate)
 	}
 	if robustRate > 0 {
-		fmt.Printf("Робастная скорость разрядки: %.2f мАч/час (на основе %d валидных интервалов)\n",
-			robustRate, validIntervals)
+		rateLevel := "good"
+		if robustRate > 1000 {
+			rateLevel = "warning"
+		} else if robustRate > 1500 {
+			rateLevel = "critical"
+		}
+		printColoredStatus("📈 Робастная скорость разрядки", fmt.Sprintf("%.2f мАч/час (на основе %d валидных интервалов)", robustRate, validIntervals), rateLevel)
 	} else {
-		fmt.Println("Робастная скорость разрядки: недостаточно данных")
+		color.Yellow("📈 Робастная скорость разрядки: недостаточно данных")
 	}
 	if remaining > 0 {
-		fmt.Printf("Оставшееся время работы: %s\n", remaining.Truncate(time.Minute).String())
+		printColoredStatus("⏰ Оставшееся время работы", remaining.Truncate(time.Minute).String(), statusLevel)
 	} else {
-		fmt.Println("Оставшееся время работы: неизвестно")
+		color.Yellow("⏰ Оставшееся время работы: неизвестно")
 	}
 
-	fmt.Println("\n=== Последние измерения (от старых к новым) ===")
+	fmt.Println()
+	color.Cyan("=== Последние измерения (от старых к новым) ===")
 	startIdx := 0
 	if len(ms) > 10 {
 		startIdx = len(ms) - 10 // Показываем последние 10
 	}
 
+	fmt.Printf("%-10s | %-5s | %-12s | %-4s | %-4s | %-4s | %-6s | %-4s\n",
+		"Время", "Заряд", "Состояние", "Цикл", "ПЕ", "ПроЕ", "ТекЕ", "Темп")
+	fmt.Println(strings.Repeat("-", 80))
+
 	for i := startIdx; i < len(ms); i++ {
+		if i < 0 {
+			continue
+		}
 		m := ms[i]
 		// Помечаем подозрительные измерения
 		marker := "  "
@@ -839,50 +1295,24 @@ func printReport(db *sqlx.DB) error {
 			}
 		}
 
-		fmt.Printf("%s%s | %d%% | %s | CC:%d | FC:%d | DC:%d | CurCap:%d\n",
-			marker, m.Timestamp, m.Percentage, strings.Title(m.State),
-			m.CycleCount, m.FullChargeCap, m.DesignCapacity, m.CurrentCapacity)
-	}
-	return nil
-}
+		timeStr := m.Timestamp[11:19] // только время
+		tempStr := "-"
+		if m.Temperature > 0 {
+			tempStr = fmt.Sprintf("%d°C", m.Temperature)
+		}
 
-// watchLoop запускает непрерывный сбор данных с заданным интервалом.
-func watchLoop(db *sqlx.DB, ctx context.Context) {
-	meas, err := getMeasurement()
-	if err != nil {
-		log.Printf("первичное измерение: %v", err)
-	} else if err = insertMeasurement(db, meas); err != nil {
-		log.Printf("запись первой записи: %v", err)
-	}
+		line := fmt.Sprintf("%s%-10s | %-5d | %-12s | %-4d | %-4d | %-4d | %-6d | %-4s",
+			marker, timeStr, m.Percentage,
+			strings.Replace(formatStateWithEmoji(m.State, m.Percentage), "🔋", "", -1)[:min(12, len(strings.Replace(formatStateWithEmoji(m.State, m.Percentage), "🔋", "", -1)))],
+			m.CycleCount, m.FullChargeCap, m.DesignCapacity, m.CurrentCapacity, tempStr)
 
-	if strings.ToLower(meas.State) == "charging" || meas.Percentage <= 0 {
-		fmt.Println("\nБатарея полностью разряжена или подключено питание. Завершаю.")
-		return
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("\nПолучен сигнал завершения. Завершаю...")
-			return
-		case <-ticker.C:
-			m, err := getMeasurement()
-			if err != nil {
-				log.Printf("измерение: %v", err)
-				continue
-			}
-			if err = insertMeasurement(db, m); err != nil {
-				log.Printf("запись измерения: %v", err)
-			}
-
-			if strings.ToLower(m.State) == "charging" || m.Percentage <= 0 {
-				fmt.Println("\nБатарея полностью разряжена или подключено питание. Завершаю.")
-				return
-			}
+		if marker == "⚠️ " {
+			color.Red(line)
+		} else {
+			fmt.Println(line)
 		}
 	}
+	return nil
 }
 
 // main – точка входа программы.
@@ -916,7 +1346,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Состояние питания: %s (%d%%)\n", strings.Title(state), percentage)
+	fmt.Printf("⚡ Состояние питания: %s (%d%%)\n", formatStateWithEmoji(state, percentage), percentage)
 
 	if onBattery {
 		fmt.Println("Компьютер работает от батареи - запускаю мониторинг и дашборд...")
