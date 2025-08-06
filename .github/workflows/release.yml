@@ -41,7 +41,7 @@ jobs:
 
     - name: 📱 Create macOS App Bundle
       run: |
-        appify -name "BatMon" -icon "./logo.png" -identifier "com.batmon.app" ./batmon-universal
+        appify -name "BatMon" -icon "./logo.png" -id "com.batmon.app" -version "1.0" ./batmon-universal
 
     - name: 📦 Package App for Distribution
       run: |

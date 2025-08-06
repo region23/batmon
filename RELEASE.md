@@ -37,7 +37,7 @@ GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o batmon-amd64
 lipo -create -output batmon-universal batmon-arm64 batmon-amd64
 
 # Создать .app bundle
-appify -name "BatMon" -icon "./logo.png" -identifier "com.batmon.app" ./batmon-universal
+appify -name "BatMon" -icon "./logo.png" -id "com.batmon.app" -version "1.0" ./batmon-universal
 
 # Упаковать для распространения
 zip -r BatMon.zip BatMon.app
