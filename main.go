@@ -64,13 +64,6 @@ type DataCollector struct {
 	profilerInterval time.Duration
 }
 
-// ExportOptions содержит настройки экспорта
-type ExportOptions struct {
-	OutputFile    string
-	Format        string // "markdown" или "html"
-	IncludeCharts bool
-}
-
 // ReportData содержит все данные для генерации отчета
 type ReportData struct {
 	GeneratedAt     time.Time
@@ -180,12 +173,6 @@ func (mb *MemoryBuffer) LoadFromDB(db *sqlx.DB, count int) error {
 }
 
 // shouldCleanup проверяет, нужна ли очистка старых данных
-func (mb *MemoryBuffer) shouldCleanup() bool {
-	mb.mu.RLock()
-	defer mb.mu.RUnlock()
-	return time.Since(mb.lastCleanup) >= mb.cleanupInterval
-}
-
 // DataRetention управляет ретенцией данных в БД
 type DataRetention struct {
 	db              *sqlx.DB
@@ -494,6 +481,7 @@ func parsePMSet() (int, string, error) {
 }
 
 // parseSystemProfiler получает данные из system_profiler.
+// На Apple Silicon многие параметры недоступны, используем то, что есть
 func parseSystemProfiler() (cycle, fullCap, designCap, currCap, temperature, voltage, amperage int, condition string, err error) {
 	cmd := exec.Command("system_profiler", "SPPowerDataType", "-detailLevel", "full")
 	out, cmdErr := cmd.Output()
@@ -508,36 +496,7 @@ func parseSystemProfiler() (cycle, fullCap, designCap, currCap, temperature, vol
 		case strings.HasPrefix(line, "Cycle Count:"):
 			val := strings.TrimSpace(strings.TrimPrefix(line, "Cycle Count:"))
 			cycle, _ = strconv.Atoi(val)
-		case strings.HasPrefix(line, "Full Charge Capacity:"):
-			val := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "Full Charge Capacity:")))[0]
-			fullCap, _ = strconv.Atoi(val)
-		case strings.HasPrefix(line, "Design Capacity:"):
-			val := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "Design Capacity:")))[0]
-			designCap, _ = strconv.Atoi(val)
-		case strings.HasPrefix(line, "Current Capacity:"):
-			val := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "Current Capacity:")))[0]
-			currCap, _ = strconv.Atoi(val)
-		case strings.HasPrefix(line, "Temperature:"):
-			val := strings.TrimSpace(strings.TrimPrefix(line, "Temperature:"))
-			// Удаляем " C" в конце и конвертируем в целое число
-			val = strings.Replace(val, " C", "", -1)
-			temperature, _ = strconv.Atoi(val)
-		case strings.HasPrefix(line, "Voltage:"):
-			// Парсим напряжение (например, "Voltage: 12345 mV")
-			val := strings.TrimSpace(strings.TrimPrefix(line, "Voltage:"))
-			if strings.Contains(val, "mV") {
-				val = strings.Fields(val)[0]
-				voltage, _ = strconv.Atoi(val)
-			}
-		case strings.HasPrefix(line, "Amperage:"):
-			// Парсим ток (например, "Amperage: -1234 mA")
-			val := strings.TrimSpace(strings.TrimPrefix(line, "Amperage:"))
-			if strings.Contains(val, "mA") {
-				val = strings.Fields(val)[0]
-				amperage, _ = strconv.Atoi(val)
-			}
 		case strings.HasPrefix(line, "Condition:"):
-			// Парсим состояние от Apple (например, "Condition: Normal")
 			condition = strings.TrimSpace(strings.TrimPrefix(line, "Condition:"))
 		}
 	}
@@ -547,38 +506,72 @@ func parseSystemProfiler() (cycle, fullCap, designCap, currCap, temperature, vol
 	return cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, nil
 }
 
-// getMeasurement собирает все данные о батарее и возвращает Measurement.
-func getMeasurement() (*Measurement, error) {
-	pct, state, pmErr := parsePMSet()
-	if pmErr != nil {
-		log.Printf("pmset: %v", pmErr)
-	}
-	cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, spErr := parseSystemProfiler()
-	if spErr != nil {
-		log.Printf("system_profiler: %v", spErr)
+// parseIORegistry получает подробные данные о батарее из ioreg
+func parseIORegistry() (cycle, fullCap, designCap, currCap, temperature, voltage, amperage int, condition string, err error) {
+	cmd := exec.Command("ioreg", "-rn", "AppleSmartBattery")
+	out, cmdErr := cmd.Output()
+	if cmdErr != nil {
+		return 0, 0, 0, 0, 0, 0, 0, "", fmt.Errorf("ioreg: %w", cmdErr)
 	}
 
-	// Вычисляем мощность (P = U * I)
-	power := 0
-	if voltage > 0 && amperage != 0 {
-		// Преобразуем мВ * мА в мВт
-		power = (voltage * amperage) / 1000
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Парсим параметры в формате "ParameterName" = Value
+		if strings.Contains(line, " = ") {
+			parts := strings.SplitN(line, " = ", 2)
+			if len(parts) != 2 {
+				continue
+			}
+
+			key := strings.Trim(parts[0], `"`)
+			value := strings.TrimSpace(parts[1])
+
+			switch key {
+			case "CycleCount":
+				cycle, _ = strconv.Atoi(value)
+			case "AppleRawMaxCapacity":
+				fullCap, _ = strconv.Atoi(value)
+			case "DesignCapacity":
+				designCap, _ = strconv.Atoi(value)
+			case "AppleRawCurrentCapacity":
+				currCap, _ = strconv.Atoi(value)
+			case "Temperature":
+				// Температура в сотых долях градуса
+				if temp, err := strconv.Atoi(value); err == nil {
+					temperature = temp / 100
+				}
+			case "Voltage":
+				voltage, _ = strconv.Atoi(value)
+			case "Amperage":
+				// Amperage может быть большим uint64, которое представляет отрицательное число
+				if amp, err := strconv.ParseUint(value, 10, 64); err == nil {
+					if amp > 9223372036854775807 { // больше максимального int64
+						// Это отрицательное число, представленное как uint64
+						amperage = int(int64(amp))
+					} else {
+						amperage = int(amp)
+					}
+				}
+			}
+		}
 	}
 
-	return &Measurement{
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		Percentage:      pct,
-		State:           state,
-		CycleCount:      cycle,
-		FullChargeCap:   fullCap,
-		DesignCapacity:  designCap,
-		CurrentCapacity: currCap,
-		Temperature:     temperature,
-		Voltage:         voltage,
-		Amperage:        amperage,
-		Power:           power,
-		AppleCondition:  condition,
-	}, nil
+	if scanErr := scanner.Err(); scanErr != nil {
+		return 0, 0, 0, 0, 0, 0, 0, "", fmt.Errorf("сканирование ioreg: %w", scanErr)
+	}
+
+	// Получаем состояние батареи из system_profiler
+	spCycle, _, _, _, _, _, _, spCondition, spErr := parseSystemProfiler()
+	if spErr == nil {
+		condition = spCondition
+		if cycle == 0 {
+			cycle = spCycle
+		}
+	}
+
+	return cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, nil
 }
 
 // insertMeasurement сохраняет Measurement в БД.
@@ -1677,10 +1670,10 @@ func (dc *DataCollector) collectAndStore() error {
 		Temperature:     0,
 	}
 
-	// Добавляем подробные данные от system_profiler, если пора
+	// Добавляем подробные данные от ioreg, если пора
 	if time.Since(dc.lastProfilerCall) >= dc.profilerInterval {
-		cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, spErr := parseSystemProfiler()
-		if spErr == nil {
+		cycle, fullCap, designCap, currCap, temperature, voltage, amperage, condition, ioErr := parseIORegistry()
+		if ioErr == nil {
 			m.CycleCount = cycle
 			m.FullChargeCap = fullCap
 			m.DesignCapacity = designCap
@@ -1697,7 +1690,7 @@ func (dc *DataCollector) collectAndStore() error {
 
 			dc.lastProfilerCall = time.Now()
 		} else {
-			// Если system_profiler не работает, используем предыдущие значения
+			// Если ioreg не работает, используем предыдущие значения
 			if latest := dc.buffer.GetLatest(); latest != nil {
 				m.CycleCount = latest.CycleCount
 				m.FullChargeCap = latest.FullChargeCap
@@ -1709,7 +1702,7 @@ func (dc *DataCollector) collectAndStore() error {
 				m.Power = latest.Power
 				m.AppleCondition = latest.AppleCondition
 			}
-			log.Printf("⚠️ system_profiler недоступен, используем кэшированные значения: %v", spErr)
+			log.Printf("⚠️ ioreg недоступен, используем кэшированные значения: %v", ioErr)
 		}
 	} else {
 		// Используем последние известные значения
@@ -1814,6 +1807,107 @@ func backgroundDataCollection(db *sqlx.DB, ctx context.Context, wg *sync.WaitGro
 	}
 }
 
+// DashboardLayout содержит размеры и позиции всех виджетов дашборда
+type DashboardLayout struct {
+	BatteryChart  struct{ X1, Y1, X2, Y2 int }
+	CapacityChart struct{ X1, Y1, X2, Y2 int }
+	InfoList      struct{ X1, Y1, X2, Y2 int }
+	StateGauge    struct{ X1, Y1, X2, Y2 int }
+	WearGauge     struct{ X1, Y1, X2, Y2 int }
+	Table         struct{ X1, Y1, X2, Y2 int }
+}
+
+// calculateLayout вычисляет адаптивный лейаут в зависимости от размера терминала
+func calculateLayout() DashboardLayout {
+	termWidth, termHeight := ui.TerminalDimensions()
+
+	// Минимальные размеры
+	if termWidth < 80 {
+		termWidth = 80
+	}
+	if termHeight < 25 {
+		termHeight = 25
+	}
+
+	var layout DashboardLayout
+
+	// Рассчитываем размеры относительно терминала
+	leftWidth := termWidth / 2
+	topHeight := (termHeight * 3) / 5 // 60% высоты для графиков
+	bottomHeight := termHeight - topHeight
+
+	// График заряда батареи (левый верхний)
+	layout.BatteryChart.X1 = 0
+	layout.BatteryChart.Y1 = 0
+	layout.BatteryChart.X2 = leftWidth
+	layout.BatteryChart.Y2 = topHeight
+
+	// График ёмкости (правый верхний)
+	layout.CapacityChart.X1 = leftWidth
+	layout.CapacityChart.Y1 = 0
+	layout.CapacityChart.X2 = termWidth
+	layout.CapacityChart.Y2 = topHeight
+
+	// Информационный список (левый нижний)
+	layout.InfoList.X1 = 0
+	layout.InfoList.Y1 = topHeight
+	layout.InfoList.X2 = leftWidth
+	layout.InfoList.Y2 = termHeight
+
+	// Правая нижняя область разделена на части
+	rightBottomHeight := bottomHeight / 3
+
+	// Гистограмма заряда
+	layout.StateGauge.X1 = leftWidth
+	layout.StateGauge.Y1 = topHeight
+	layout.StateGauge.X2 = termWidth
+	layout.StateGauge.Y2 = topHeight + rightBottomHeight
+
+	// Гистограмма износа
+	layout.WearGauge.X1 = leftWidth
+	layout.WearGauge.Y1 = topHeight + rightBottomHeight
+	layout.WearGauge.X2 = termWidth
+	layout.WearGauge.Y2 = topHeight + 2*rightBottomHeight
+
+	// Таблица последних измерений
+	layout.Table.X1 = leftWidth
+	layout.Table.Y1 = topHeight + 2*rightBottomHeight
+	layout.Table.X2 = termWidth
+	layout.Table.Y2 = termHeight
+
+	return layout
+}
+
+// applyLayout применяет рассчитанный лейаут к виджетам
+func applyLayout(layout DashboardLayout, batteryChart, capacityChart *widgets.Plot,
+	infoList *widgets.List, stateGauge, wearGauge *widgets.Gauge, table *widgets.Table) {
+
+	batteryChart.SetRect(layout.BatteryChart.X1, layout.BatteryChart.Y1,
+		layout.BatteryChart.X2, layout.BatteryChart.Y2)
+	capacityChart.SetRect(layout.CapacityChart.X1, layout.CapacityChart.Y1,
+		layout.CapacityChart.X2, layout.CapacityChart.Y2)
+	infoList.SetRect(layout.InfoList.X1, layout.InfoList.Y1,
+		layout.InfoList.X2, layout.InfoList.Y2)
+	stateGauge.SetRect(layout.StateGauge.X1, layout.StateGauge.Y1,
+		layout.StateGauge.X2, layout.StateGauge.Y2)
+	wearGauge.SetRect(layout.WearGauge.X1, layout.WearGauge.Y1,
+		layout.WearGauge.X2, layout.WearGauge.Y2)
+	table.SetRect(layout.Table.X1, layout.Table.Y1,
+		layout.Table.X2, layout.Table.Y2)
+}
+
+// getDashboardHotkeys возвращает подсказки по горячим клавишам для дашборда
+func getDashboardHotkeys() []string {
+	return []string{
+		"",
+		"═══ ГОРЯЧИЕ КЛАВИШИ ═══",
+		"⌨️  'q' / Ctrl+C - Выход",
+		"🔄 'r' - Обновить данные",
+		"📊 'h' - Показать справку",
+		"📈 Автообновление: каждые 10с",
+	}
+}
+
 // showDashboard отображает интерактивный дашборд в терминале
 func showDashboard(db *sqlx.DB, ctx context.Context) error {
 	if err := ui.Init(); err != nil {
@@ -1831,7 +1925,7 @@ func showDashboard(db *sqlx.DB, ctx context.Context) error {
 		// Если данных нет, показываем заглушку и ждем первых данных
 		placeholder := widgets.NewParagraph()
 		placeholder.Title = "Сбор данных"
-		placeholder.Text = "Ожидание первых измерений батареи...\nДанные появятся через несколько секунд.\n\nНажмите 'q' для выхода"
+		placeholder.Text = "Ожидание первых измерений батареи...\nДанные появятся через несколько секунд.\n\n⌨️ Горячие клавиши:\n'q' / Ctrl+C - Выход\n'h' - Справка"
 		placeholder.SetRect(0, 0, 80, 10)
 
 		ui.Render(placeholder)
@@ -1859,28 +1953,51 @@ func showDashboard(db *sqlx.DB, ctx context.Context) error {
 	}
 
 renderDashboard:
+	// Еще раз проверяем, что данные есть (на случай goto)
+	if len(measurements) == 0 {
+		return fmt.Errorf("нет данных для отображения дашборда")
+	}
 
 	// График заряда батареи
 	batteryChart := widgets.NewPlot()
 	batteryChart.Title = "Заряд батареи (%)"
 	batteryChart.Data = make([][]float64, 1)
-	batteryChart.Data[0] = make([]float64, len(measurements))
-	for i, m := range measurements {
-		batteryChart.Data[0][i] = float64(m.Percentage)
+
+	// Убеждаемся, что у нас есть минимум 2 точки для корректной отрисовки
+	dataSize := len(measurements)
+	if dataSize < 2 {
+		// Дублируем единственную точку для корректной отрисовки
+		batteryChart.Data[0] = make([]float64, 2)
+		batteryChart.Data[0][0] = float64(measurements[0].Percentage)
+		batteryChart.Data[0][1] = float64(measurements[0].Percentage)
+	} else {
+		batteryChart.Data[0] = make([]float64, dataSize)
+		for i, m := range measurements {
+			batteryChart.Data[0][i] = float64(m.Percentage)
+		}
 	}
-	batteryChart.SetRect(0, 0, 60, 15)
-	batteryChart.AxesColor = ui.ColorWhite
-	batteryChart.LineColors[0] = ui.ColorGreen
 
 	// График емкости
 	capacityChart := widgets.NewPlot()
 	capacityChart.Title = "Текущая емкость (мАч)"
 	capacityChart.Data = make([][]float64, 1)
-	capacityChart.Data[0] = make([]float64, len(measurements))
-	for i, m := range measurements {
-		capacityChart.Data[0][i] = float64(m.CurrentCapacity)
+
+	// Убеждаемся, что у нас есть минимум 2 точки для корректной отрисовки
+	if dataSize < 2 {
+		// Дублируем единственную точку для корректной отрисовки
+		capacityChart.Data[0] = make([]float64, 2)
+		capacityChart.Data[0][0] = float64(measurements[0].CurrentCapacity)
+		capacityChart.Data[0][1] = float64(measurements[0].CurrentCapacity)
+	} else {
+		capacityChart.Data[0] = make([]float64, dataSize)
+		for i, m := range measurements {
+			capacityChart.Data[0][i] = float64(m.CurrentCapacity)
+		}
 	}
-	capacityChart.SetRect(60, 0, 120, 15)
+
+	// Стили графиков
+	batteryChart.AxesColor = ui.ColorWhite
+	batteryChart.LineColors[0] = ui.ColorGreen
 	capacityChart.AxesColor = ui.ColorWhite
 	capacityChart.LineColors[0] = ui.ColorBlue
 
@@ -1926,15 +2043,13 @@ renderDashboard:
 		}
 	}
 
-	infoRows = append(infoRows, "", "Нажмите 'q' для выхода", "Нажмите 'r' для обновления")
+	infoRows = append(infoRows, getDashboardHotkeys()...)
 	infoList.Rows = infoRows
-	infoList.SetRect(0, 15, 60, 25)
 
 	// Гистограмма состояний
 	stateGauge := widgets.NewGauge()
 	stateGauge.Title = "Заряд батареи"
 	stateGauge.Percent = latest.Percentage
-	stateGauge.SetRect(60, 15, 120, 18)
 	stateGauge.BarColor = ui.ColorGreen
 	if latest.Percentage < 20 {
 		stateGauge.BarColor = ui.ColorRed
@@ -1946,7 +2061,6 @@ renderDashboard:
 	wearGauge := widgets.NewGauge()
 	wearGauge.Title = "Износ батареи"
 	wearGauge.Percent = int(wear)
-	wearGauge.SetRect(60, 18, 120, 21)
 	wearGauge.BarColor = ui.ColorRed
 
 	// Таблица последних измерений
@@ -1968,7 +2082,9 @@ renderDashboard:
 			fmt.Sprintf("%d мАч", m.CurrentCapacity),
 		})
 	}
-	table.SetRect(60, 21, 120, 25)
+	// Применяем адаптивный лейаут
+	layout := calculateLayout()
+	applyLayout(layout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
 
 	render := func() {
 		ui.Render(batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
@@ -1988,6 +2104,12 @@ renderDashboard:
 			switch e.ID {
 			case "q", "<C-c>":
 				return nil
+			case "<Resize>":
+				// Обработка изменения размера терминала
+				newLayout := calculateLayout()
+				applyLayout(newLayout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
+				ui.Clear()
+				render()
 			case "r":
 				// Обновляем данные
 				newMeasurements, err := getLastNMeasurements(db, 50)
@@ -2047,10 +2169,57 @@ renderDashboard:
 						}
 					}
 
-					infoRows = append(infoRows, "", "Нажмите 'q' для выхода", "Нажмите 'r' для обновления")
+					infoRows = append(infoRows, getDashboardHotkeys()...)
 					infoList.Rows = infoRows
 
+					// Обновляем лейаут на случай изменения размера
+					newLayout := calculateLayout()
+					applyLayout(newLayout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
+
 					render()
+				}
+			case "h":
+				// Показываем справку
+				helpWidget := widgets.NewParagraph()
+				helpWidget.Title = "Справка - BatMon v2.0"
+				helpWidget.Text = `🔋 ИНТЕРАКТИВНЫЙ МОНИТОРИНГ БАТАРЕИ
+
+ОПИСАНИЕ ГРАФИКОВ:
+• Левый график - процент заряда батареи во времени
+• Правый график - текущая ёмкость в мАч во времени
+• Таблица - последние 5 измерений с временными метками
+
+ГОРЯЧИЕ КЛАВИШИ:
+• 'q' / Ctrl+C - выход из мониторинга
+• 'r' - принудительное обновление данных
+• 'h' - показать эту справку (нажмите любую клавишу для возврата)
+
+ПОКАЗАТЕЛИ:
+• Заряд - текущий процент заряда батареи
+• Состояние - режим работы (заряжается/разряжается/подключен)
+• Циклы - количество полных циклов заряда-разряда
+• Износ - процент износа относительно заводской ёмкости
+• Скорость - текущая скорость разряда в мАч/час
+• Время - примерное оставшееся время работы
+
+Данные обновляются автоматически каждые 10 секунд.
+Нажмите любую клавишу для возврата к мониторингу...`
+
+				// Устанавливаем размер на весь экран
+				termWidth, termHeight := ui.TerminalDimensions()
+				helpWidget.SetRect(0, 0, termWidth, termHeight)
+
+				ui.Clear()
+				ui.Render(helpWidget)
+
+				// Ждем нажатия любой клавиши
+				for {
+					helpEvent := <-uiEvents
+					if helpEvent.Type == ui.KeyboardEvent {
+						ui.Clear()
+						render() // Возвращаем обычный дашборд
+						break
+					}
 				}
 			}
 		case <-ticker.C:
@@ -2117,7 +2286,7 @@ renderDashboard:
 					}
 				}
 
-				infoRows = append(infoRows, "", "Нажмите 'q' для выхода", "Нажмите 'r' для обновления")
+				infoRows = append(infoRows, getDashboardHotkeys()...)
 				infoList.Rows = infoRows // Обновляем таблицу последних измерений
 				table.Rows = [][]string{
 					{"Время", "Заряд", "Состояние", "Емкость"},
@@ -2135,6 +2304,10 @@ renderDashboard:
 						fmt.Sprintf("%d мАч", m.CurrentCapacity),
 					})
 				}
+
+				// Обновляем лейаут на случай изменения размера
+				newLayout := calculateLayout()
+				applyLayout(newLayout, batteryChart, capacityChart, infoList, stateGauge, wearGauge, table)
 
 				render()
 			}
