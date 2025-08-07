@@ -553,6 +553,9 @@ type App struct {
 	// Скроллинг отчета
 	reportScrollY int
 	
+	// Скроллинг dashboard
+	dashboardScrollY int
+	
 	// Ошибки
 	lastError error
 }
@@ -3149,7 +3152,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.windowWidth = msg.Width
 		a.windowHeight = msg.Height
-		a.menu.list.SetSize(msg.Width-2, msg.Height-4)
+		a.updateComponentSizes()
 		
 	case tea.KeyMsg:
 		switch a.state {
@@ -3231,11 +3234,25 @@ func (a *App) updateDashboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q", "й":
 		a.state = StateMenu
+		a.dashboardScrollY = 0 // Сбрасываем скролл при выходе
 		return a, nil
 	case "r", "к":
 		return a, updateData(a.dataService)
 	case "h", "р":
 		// Показать краткую справку (можно расширить позже)
+		return a, nil
+	case "up", "k", "л":
+		// Скролл вверх
+		if a.dashboardScrollY > 0 {
+			a.dashboardScrollY--
+		}
+		return a, nil
+	case "down", "j", "о":
+		// Скролл вниз (максимум определяется в renderDashboard)
+		maxScroll := a.calculateMaxDashboardScroll()
+		if a.dashboardScrollY < maxScroll {
+			a.dashboardScrollY++
+		}
 		return a, nil
 	}
 	return a, nil
@@ -3436,6 +3453,116 @@ func (a *App) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
+// updateComponentSizes обновляет размеры всех компонентов при изменении размера окна
+func (a *App) updateComponentSizes() {
+	// Обновляем размер списка меню
+	a.menu.list.SetSize(a.windowWidth-2, a.windowHeight-4)
+	
+	// Обновляем размеры компонентов dashboard
+	if a.state == StateDashboard {
+		// Пересчитываем ширину прогресс-баров
+		progressWidth := (a.windowWidth / 2) - 20
+		if progressWidth < 20 {
+			progressWidth = 20
+		}
+		if progressWidth > 40 {
+			progressWidth = 40
+		}
+		
+		// Обновляем ширину прогресс-баров
+		a.dashboard.batteryGauge = progress.New(
+			progress.WithDefaultGradient(),
+			progress.WithWidth(progressWidth),
+		)
+		a.dashboard.wearGauge = progress.New(
+			progress.WithDefaultGradient(),
+			progress.WithWidth(progressWidth),
+		)
+		
+		// Обновляем размеры таблицы измерений с фиксированными колонками
+		columns := []table.Column{
+			{Title: "Время", Width: 5},
+			{Title: "Заряд", Width: 5},
+			{Title: "Состояние", Width: 10},
+			{Title: "Темп.", Width: 5},
+		}
+		
+		a.dashboard.measureTable = table.New(
+			table.WithColumns(columns),
+			table.WithHeight(4), // Фиксированная высота для 4 записей
+			table.WithFocused(false),
+		)
+		
+		// Обновляем данные таблицы
+		a.updateDashboardData()
+	}
+	
+	// Обновляем размеры компонентов отчета
+	if a.state == StateReport {
+		a.report.viewHeight = a.windowHeight - 4
+		
+		// Обновляем размеры таблицы истории
+		tableWidth := a.windowWidth - 10
+		columnWidths := a.calculateReportTableColumnWidths(tableWidth)
+		
+		columns := []table.Column{
+			{Title: "Время", Width: columnWidths[0]},
+			{Title: "Заряд", Width: columnWidths[1]},
+			{Title: "Состояние", Width: columnWidths[2]},
+			{Title: "Циклы", Width: columnWidths[3]},
+			{Title: "Темп.", Width: columnWidths[4]},
+			{Title: "Износ", Width: columnWidths[5]},
+		}
+		
+		tableHeight := min(20, a.windowHeight-10)
+		a.report.historyTable = table.New(
+			table.WithColumns(columns),
+			table.WithHeight(tableHeight),
+			table.WithFocused(false),
+		)
+	}
+}
+
+// calculateTableColumnWidths вычисляет ширину колонок для таблицы dashboard
+func (a *App) calculateTableColumnWidths(totalWidth int) []int {
+	// Фиксированные ширины для компактной таблицы
+	// Время: 5 символов (HH:MM)
+	// Заряд: 4 символа (100%)
+	// Состояние: 10 символов
+	// Темп: 4 символа (30°C)
+	return []int{5, 4, 10, 4}
+}
+
+// calculateReportTableColumnWidths вычисляет ширину колонок для таблицы отчета
+func (a *App) calculateReportTableColumnWidths(totalWidth int) []int {
+	// Минимальные ширины колонок
+	minWidths := []int{16, 6, 10, 6, 6, 6}
+	
+	// Если места недостаточно, используем минимальные ширины
+	minTotal := 0
+	for _, w := range minWidths {
+		minTotal += w
+	}
+	
+	if totalWidth <= minTotal+6 {
+		return minWidths
+	}
+	
+	// Распределяем дополнительное пространство
+	extraSpace := totalWidth - minTotal - 6
+	
+	// Пропорции для дополнительного пространства
+	widths := make([]int, 6)
+	widths[0] = minWidths[0] + (extraSpace * 35 / 100) // Время
+	widths[1] = minWidths[1] + (extraSpace * 10 / 100) // Заряд
+	widths[2] = minWidths[2] + (extraSpace * 35 / 100) // Состояние
+	widths[3] = minWidths[3] + (extraSpace * 5 / 100)  // Циклы
+	widths[4] = minWidths[4] + (extraSpace * 10 / 100) // Темп
+	widths[5] = minWidths[5] + (extraSpace * 5 / 100)  // Износ
+	
+	return widths
+}
+
 // View рендерит интерфейс
 func (a *App) View() string {
 	switch a.state {
@@ -3481,7 +3608,61 @@ func (a *App) renderDashboard() string {
 		return a.renderCompactDashboard()
 	}
 	
-	return a.renderFullDashboard(contentWidth, contentHeight)
+	// Рендерим полный dashboard
+	fullContent := a.renderFullDashboard(contentWidth, contentHeight)
+	
+	// Если контент не влезает по высоте, применяем скролл
+	contentLines := strings.Split(fullContent, "\n")
+	if len(contentLines) > contentHeight {
+		// Применяем скролл
+		start := a.dashboardScrollY
+		end := start + contentHeight
+		if end > len(contentLines) {
+			end = len(contentLines)
+		}
+		if start > len(contentLines)-contentHeight {
+			start = max(0, len(contentLines)-contentHeight)
+			a.dashboardScrollY = start
+		}
+		
+		scrolledContent := strings.Join(contentLines[start:end], "\n")
+		
+		// Добавляем индикатор скролла
+		scrollInfo := ""
+		if a.dashboardScrollY > 0 || end < len(contentLines) {
+			scrollInfo = fmt.Sprintf("   ↕ Скролл: %d/%d (↑↓/kj)", a.dashboardScrollY+1, len(contentLines)-contentHeight+1)
+			scrolledContent += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(scrollInfo)
+		}
+		
+		return scrolledContent
+	}
+	
+	return fullContent
+}
+
+// calculateMaxDashboardScroll вычисляет максимальное значение скролла для dashboard
+func (a *App) calculateMaxDashboardScroll() int {
+	if a.latest == nil {
+		return 0
+	}
+	
+	contentWidth := a.windowWidth - 4
+	contentHeight := a.windowHeight - 4
+	
+	if contentWidth < 60 || contentHeight < 20 {
+		return 0 // Компактный режим не скроллится
+	}
+	
+	// Рендерим контент и считаем строки
+	fullContent := a.renderFullDashboard(contentWidth, contentHeight)
+	contentLines := strings.Split(fullContent, "\n")
+	
+	maxScroll := len(contentLines) - contentHeight
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	
+	return maxScroll
 }
 
 // renderLoadingScreen показывает экран загрузки
@@ -3581,8 +3762,7 @@ func (a *App) renderCompactDashboard() string {
 
 // renderFullDashboard рендерит полную версию dashboard
 func (a *App) renderFullDashboard(width, height int) string {
-	// Размеры для графиков
-	// Данные для простого отображения графиков
+	// Данные для графиков
 	batteryData := make([]float64, 0, len(a.measurements))
 	capacityData := make([]float64, 0, len(a.measurements))
 	
@@ -3591,9 +3771,26 @@ func (a *App) renderFullDashboard(width, height int) string {
 		capacityData = append(capacityData, float64(m.CurrentCapacity))
 	}
 	
-	// Создаем реальные графики
-	chartWidth := width/2 - 2
-	chartHeight := height/2 - 2
+	// Адаптивные размеры для графиков
+	// Учитываем отступы и границы
+	chartWidth := (width - 4) / 2  // Делим пополам с учетом отступов
+	chartHeight := (height - 6) / 2 // Делим пополам с учетом заголовков
+	
+	// Минимальные размеры для читабельности
+	if chartWidth < 30 {
+		chartWidth = 30
+	}
+	if chartHeight < 10 {
+		chartHeight = 10
+	}
+	
+	// Максимальные размеры для больших экранов
+	if chartWidth > 80 {
+		chartWidth = 80
+	}
+	if chartHeight > 30 {
+		chartHeight = 30
+	}
 	
 	var batteryChartContent, capacityChartContent string
 	
@@ -3602,7 +3799,13 @@ func (a *App) renderFullDashboard(width, height int) string {
 		batteryChart.SetData(batteryData)
 		batteryChartContent = batteryChart.Render()
 	} else {
-		batteryChartContent = "📊 График заряда\n[Нет данных для отображения]"
+		emptyStyle := lipgloss.NewStyle().
+			Width(chartWidth).
+			Height(chartHeight).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("240")).
+			Align(lipgloss.Center, lipgloss.Center)
+		batteryChartContent = emptyStyle.Render("📊 График заряда\n\nНет данных для отображения")
 	}
 	
 	if len(capacityData) > 0 {
@@ -3610,29 +3813,44 @@ func (a *App) renderFullDashboard(width, height int) string {
 		capacityChart.SetData(capacityData)
 		capacityChartContent = capacityChart.Render()
 	} else {
-		capacityChartContent = "📈 График емкости\n[Нет данных для отображения]"
+		emptyStyle := lipgloss.NewStyle().
+			Width(chartWidth).
+			Height(chartHeight).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("240")).
+			Align(lipgloss.Center, lipgloss.Center)
+		capacityChartContent = emptyStyle.Render("📈 График емкости\n\nНет данных для отображения")
 	}
 	
-	// Информационная панель
-	infoPanel := a.renderInfoPanel(width/2, height/2)
+	// Информационная панель с адаптивными размерами
+	infoPanelWidth := (width - 4) / 2
+	infoPanelHeight := (height - 6) / 2
+	infoPanel := a.renderInfoPanel(infoPanelWidth, infoPanelHeight)
 	
-	// Статистика
-	statsPanel := a.renderStatsPanel(width/2, height/2)
+	// Статистика с адаптивными размерами
+	statsPanelWidth := (width - 4) / 2
+	statsPanelHeight := (height - 6) / 2
+	statsPanel := a.renderStatsPanel(statsPanelWidth, statsPanelHeight)
 	
-	// Компоновка: графики сверху, панели снизу
+	// Возвращаем оригинальную компоновку: графики сверху, текстовые блоки снизу
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top,
 		batteryChartContent,
-		" ", // Разделитель
+		" ",
 		capacityChartContent,
 	)
 	
 	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top,
 		infoPanel,
-		" ", // Разделитель  
+		" ",
 		statsPanel,
 	)
 	
-	return lipgloss.JoinVertical(lipgloss.Left, topRow, "", bottomRow)
+	// Вертикальная компоновка с разделителем
+	return lipgloss.JoinVertical(lipgloss.Left,
+		topRow,
+		"",
+		bottomRow,
+	)
 }
 
 // renderInfoPanel рендерит информационную панель
@@ -3698,7 +3916,7 @@ func (a *App) renderInfoPanel(width, height int) string {
 		BorderForeground(getBatteryColor(a.latest.Percentage)).
 		Padding(1).
 		Width(width-2).
-		Height(height-2).
+		Height(height).
 		Render(content)
 }
 
@@ -3710,35 +3928,31 @@ func (a *App) renderStatsPanel(width, height int) string {
 	// Рендерим таблицу
 	tableView := a.dashboard.measureTable.View()
 	
-	content := fmt.Sprintf(`Последние измерения
-
-%s
-
-Управление:
-   'q'/'й' - выход в меню
-   'r'/'к' - обновить данные
-   'h'/'р' - показать справку
-
-Поддержка мультиязычных
-горячих клавиш`,
-		tableView,
-	)
+	// Создаем контент с правильным форматированием
+	var contentBuilder strings.Builder
+	contentBuilder.WriteString("Последние измерения\n")
+	contentBuilder.WriteString(tableView)
+	contentBuilder.WriteString("\n\n")
+	contentBuilder.WriteString("Управление:\n")
+	contentBuilder.WriteString("  'q'/'й' - выход\n")
+	contentBuilder.WriteString("  'r'/'к' - обновить\n")
+	contentBuilder.WriteString("  ↑↓/jk - скролл")
 	
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(1).
-		Width(width-4).
-		Height(height-2).
-		Render(content)
+		Width(width-2).
+		Height(height).
+		Render(contentBuilder.String())
 }
 
 // updateMeasureTable обновляет данные в таблице измерений
 func (a *App) updateMeasureTable() {
 	rows := make([]table.Row, 0)
 	
-	// Берем последние 5 измерений
-	recentCount := 5
+	// Берем последние 4 измерения
+	recentCount := 4
 	if len(a.measurements) < recentCount {
 		recentCount = len(a.measurements)
 	}
@@ -3756,19 +3970,25 @@ func (a *App) updateMeasureTable() {
 			
 			// Форматируем состояние
 			stateStr := m.State
-			if len(stateStr) > 8 {
-				stateStr = stateStr[:8] + "..."
+			if len(stateStr) > 10 {
+				stateStr = stateStr[:9] + "."
 			}
 			
 			// Форматируем температуру
 			tempStr := "-"
 			if m.Temperature > 0 {
-				tempStr = fmt.Sprintf("%d°C", m.Temperature)
+				tempStr = fmt.Sprintf("%d°", m.Temperature)
+			}
+			
+			// Форматируем заряд компактно
+			chargeStr := fmt.Sprintf("%d%%", m.Percentage)
+			if m.Percentage == 100 {
+				chargeStr = "100"
 			}
 			
 			row := table.Row{
 				timeStr,
-				fmt.Sprintf("%d%%", m.Percentage),
+				chargeStr,
 				stateStr,
 				tempStr,
 			}
@@ -3889,24 +4109,64 @@ func (a *App) renderReport() string {
 	// Рендерим табы
 	tabBar := a.renderTabBar()
 	
+	// Добавляем панель управления
+	helpBar := a.renderReportHelpBar()
+	
+	// Вычисляем доступное пространство для контента
+	contentHeight := a.windowHeight - 8 // Учитываем табы, помощь, отступы
+	
+	// Применяем скролл если нужно
+	scrolledContent := a.applyReportScroll(tabContent, contentHeight)
+	
 	// Создаем финальный контент
 	var content strings.Builder
 	content.WriteString(tabBar)
 	content.WriteString("\n")
-	content.WriteString(tabContent)
-	
-	// Добавляем панель управления
-	helpBar := a.renderReportHelpBar()
+	content.WriteString(scrolledContent)
 	content.WriteString("\n")
 	content.WriteString(helpBar)
 	
-	// Оборачиваем в стильную рамку
+	// Оборачиваем в компактную рамку
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(a.getTabColor()).
 		Padding(1).
 		Width(a.windowWidth-4).
 		Render(content.String())
+}
+
+// applyReportScroll применяет скролл к контенту вкладки
+func (a *App) applyReportScroll(content string, maxHeight int) string {
+	contentLines := strings.Split(content, "\n")
+	
+	if len(contentLines) <= maxHeight {
+		// Контент влезает полностью
+		return content
+	}
+	
+	// Применяем скролл
+	start := a.reportScrollY
+	end := start + maxHeight
+	
+	// Корректируем границы
+	if end > len(contentLines) {
+		end = len(contentLines)
+	}
+	if start > len(contentLines)-maxHeight {
+		start = max(0, len(contentLines)-maxHeight)
+		a.reportScrollY = start
+	}
+	
+	scrolledLines := contentLines[start:end]
+	scrolledContent := strings.Join(scrolledLines, "\n")
+	
+	// Добавляем индикатор скролла
+	if start > 0 || end < len(contentLines) {
+		scrollInfo := fmt.Sprintf("   ↕ %d/%d", start+1, len(contentLines)-maxHeight+1)
+		scrolledContent += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(scrollInfo)
+	}
+	
+	return scrolledContent
 }
 
 // buildReportContent создает содержимое отчета на основе данных аналитики
@@ -4116,17 +4376,25 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%d мин", minutes)
 }
 
-// renderTabBar рендерит панель вкладок
+// renderTabBar рендерит компактную панель вкладок
 func (a *App) renderTabBar() string {
 	var tabs []string
-	for i, tab := range a.report.tabs {
+	
+	// Компактные названия вкладок
+	compactTabs := []string{"Обзор", "Графики", "Аномалии", "История", "Прогноз"}
+	
+	for i, tab := range compactTabs {
+		if i >= len(a.report.tabs) {
+			break
+		}
+		
 		style := lipgloss.NewStyle().
 			Padding(0, 1)
 		
 		if i == a.report.activeTab {
 			// Активная вкладка
 			style = style.
-				Background(lipgloss.Color("62")).
+				Background(a.getTabColor()).
 				Foreground(lipgloss.Color("230")).
 				Bold(true)
 		} else {
@@ -4135,11 +4403,14 @@ func (a *App) renderTabBar() string {
 				Foreground(lipgloss.Color("241"))
 		}
 		
-		tabText := fmt.Sprintf("[%d] %s", i+1, tab)
+		// Компактный формат
+		tabText := fmt.Sprintf("%d.%s", i+1, tab)
 		tabs = append(tabs, style.Render(tabText))
 	}
 	
-	return lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
+	// Разделители между вкладками
+	separator := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("│")
+	return strings.Join(tabs, separator)
 }
 
 // getTabColor возвращает цвет для активной вкладки
@@ -4158,25 +4429,29 @@ func (a *App) getTabColor() lipgloss.Color {
 	return lipgloss.Color("240")
 }
 
-// renderReportHelpBar рендерит панель помощи
+// renderReportHelpBar рендерит компактную панель помощи
 func (a *App) renderReportHelpBar() string {
 	helpStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
 		Padding(0, 1)
 	
+	// Базовые команды
 	help := []string{
-		"← → Табы",
-		"1-5 Быстрый переход",
-		"↑↓ Скролл",
-		"r Обновить",
-		"q Выход",
+		"←→",  // Переключение вкладок
+		"1-5", // Быстрый переход
+		"↑↓",  // Скролл
+		"r",   // Обновить
+		"q",   // Выход
 	}
 	
+	// Специфичные для вкладки команды
 	if a.report.activeTab == 3 { // История
-		help = append([]string{"f Фильтр", "s Сортировка"}, help...)
+		help = append([]string{"f", "s"}, help...)
 	}
 	
-	return helpStyle.Render(strings.Join(help, " • "))
+	// Компактное отображение с минимальными разделителями
+	separator := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("·")
+	return helpStyle.Render(strings.Join(help, separator))
 }
 
 // renderReportOverview рендерит вкладку обзора с виджетами
@@ -4268,20 +4543,40 @@ func (a *App) createOverviewWidgets(data *ReportData) []ReportWidget {
 	return widgets
 }
 
-// renderWidgetsGrid рендерит виджеты в сетке
+// renderWidgetsGrid рендерит виджеты в компактной сетке
 func (a *App) renderWidgetsGrid(widgets []ReportWidget) string {
 	var rows []string
-	widgetWidth := (a.windowWidth - 10) / 2 // Два виджета в ряд
 	
-	for i := 0; i < len(widgets); i += 2 {
+	// Более умный адаптивный расчет
+	availableWidth := a.windowWidth - 8  // Учитываем отступы интерфейса
+	availableHeight := a.windowHeight - 8
+	numColumns := 2
+	
+	// Адаптируем количество колонок под размер экрана
+	if availableWidth < 50 {
+		numColumns = 1
+	} else if availableWidth > 120 {
+		numColumns = 3
+	} else if availableWidth > 200 {
+		numColumns = 4
+	}
+	
+	// Супер компактные размеры виджетов
+	widgetWidth := max(25, (availableWidth - (numColumns-1)*2) / numColumns)
+	widgetHeight := max(4, min(6, availableHeight / ((len(widgets)+numColumns-1)/numColumns)))  // Макс. 6 строк на виджет
+	
+	for i := 0; i < len(widgets); i += numColumns {
 		var row []string
 		
-		// Первый виджет в ряду
-		row = append(row, a.renderWidget(widgets[i], widgetWidth))
+		for j := 0; j < numColumns && i+j < len(widgets); j++ {
+			widget := a.renderCompactWidget(widgets[i+j], widgetWidth, widgetHeight)
+			row = append(row, widget)
+		}
 		
-		// Второй виджет в ряду (если есть)
-		if i+1 < len(widgets) {
-			row = append(row, a.renderWidget(widgets[i+1], widgetWidth))
+		// Заполняем пустые места если нужно
+		for len(row) < numColumns && numColumns > 1 {
+			emptySpace := lipgloss.NewStyle().Width(widgetWidth).Height(widgetHeight).Render("")
+			row = append(row, emptySpace)
 		}
 		
 		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, row...))
@@ -4293,58 +4588,215 @@ func (a *App) renderWidgetsGrid(widgets []ReportWidget) string {
 // renderWidgetsVertical рендерит виджеты вертикально
 func (a *App) renderWidgetsVertical(widgets []ReportWidget) string {
 	var rows []string
-	widgetWidth := a.windowWidth - 10
+	widgetWidth := max(30, a.windowWidth - 8)
+	widgetHeight := max(4, min(6, (a.windowHeight-8) / len(widgets)))  // Компактнее
 	
 	for _, widget := range widgets {
-		rows = append(rows, a.renderWidget(widget, widgetWidth))
+		rows = append(rows, a.renderCompactWidget(widget, widgetWidth, widgetHeight))
 	}
 	
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
-// renderWidget рендерит отдельный виджет
-func (a *App) renderWidget(widget ReportWidget, width int) string {
+// renderCompactWidget рендерит супер компактный виджет
+func (a *App) renderCompactWidget(widget ReportWidget, width, height int) string {
+	// Минимальные размеры для максимальной компактности
+	adaptiveWidth := max(25, min(width, 45))
+	adaptiveHeight := max(4, min(height, 6))  // Уменьшили минимальную высоту
+	
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(widget.color).
-		Width(width).
-		Padding(1).
-		Margin(0, 1, 1, 0)
+		Width(adaptiveWidth).
+		Height(adaptiveHeight).
+		Padding(0, 1).  // Убрали вертикальные отступы
+		Margin(0, 1, 0, 0)  // Убрали нижний отступ
+	
+	var content strings.Builder
+	
+	// Компактный заголовок
+	titleStyle := lipgloss.NewStyle().
+		Foreground(widget.color).
+		Bold(true)
+	
+	// Убираем эмодзи из заголовка для экономии места
+	cleanTitle := strings.ReplaceAll(widget.title, "💚 ", "")
+	cleanTitle = strings.ReplaceAll(cleanTitle, "🔋 ", "")
+	cleanTitle = strings.ReplaceAll(cleanTitle, "⚙️ ", "")
+	cleanTitle = strings.ReplaceAll(cleanTitle, "🔥 ", "")
+	cleanTitle = strings.ReplaceAll(cleanTitle, "📊 ", "")
+	cleanTitle = strings.ReplaceAll(cleanTitle, "⏱️ ", "")
+	
+	if len(cleanTitle) > adaptiveWidth-4 {
+		cleanTitle = cleanTitle[:adaptiveWidth-7] + "..."
+	}
+	
+	content.WriteString(titleStyle.Render(cleanTitle))
+	content.WriteString("\n")
+	
+	switch widget.widgetType {
+	case "gauge":
+		// Супер компактный прогресс-бар в одной строке с процентами
+		barWidth := max(8, adaptiveWidth-10)
+		bar := a.renderCompactProgressBar(widget.value, widget.maxValue, barWidth)
+		
+		// Процент справа от бара
+		percentage := (widget.value / widget.maxValue) * 100
+		valueStr := fmt.Sprintf("%.0f%%", percentage)
+		
+		// Все в одной строке
+		progressLine := bar + " " + lipgloss.NewStyle().Foreground(widget.color).Bold(true).Render(valueStr)
+		content.WriteString(progressLine)
+		
+	case "info":
+		// Супер компактная информация - только первая строка
+		infoLines := strings.Split(widget.content, "\n")
+		if len(infoLines) > 0 {
+			line := infoLines[0]
+			if len(line) > adaptiveWidth-4 {
+				line = line[:adaptiveWidth-7] + "..."
+			}
+			content.WriteString(line)
+		}
+		
+	case "alert":
+		// Компактное предупреждение
+		alertStyle := lipgloss.NewStyle().
+			Foreground(widget.color).
+			Background(lipgloss.Color("52")).
+			Padding(0, 1)
+		
+		alertText := widget.content
+		if len(alertText) > adaptiveWidth-6 {
+			alertText = alertText[:adaptiveWidth-9] + "..."
+		}
+		content.WriteString(alertStyle.Render(alertText))
+		
+	default:
+		// Обычное содержимое
+		if len(widget.content) > adaptiveWidth-4 {
+			content.WriteString(widget.content[:adaptiveWidth-7] + "...")
+		} else {
+			content.WriteString(widget.content)
+		}
+	}
+	
+	return style.Render(content.String())
+}
+
+// renderCompactProgressBar рендерит компактный прогресс-бар
+func (a *App) renderCompactProgressBar(value, maxValue float64, width int) string {
+	if maxValue == 0 {
+		return strings.Repeat("░", width)
+	}
+	
+	percentage := value / maxValue
+	if percentage > 1 {
+		percentage = 1
+	}
+	
+	filled := int(percentage * float64(width))
+	
+	// Используем простые символы для лучшей совместимости
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	
+	// Цветовая градация
+	barStyle := lipgloss.NewStyle()
+	if percentage > 0.7 {
+		barStyle = barStyle.Foreground(lipgloss.Color("46")) // Зеленый
+	} else if percentage > 0.4 {
+		barStyle = barStyle.Foreground(lipgloss.Color("226")) // Желтый
+	} else {
+		barStyle = barStyle.Foreground(lipgloss.Color("196")) // Красный
+	}
+	
+	return barStyle.Render(bar)
+}
+
+// renderWidget рендерит отдельный виджет
+func (a *App) renderWidget(widget ReportWidget, width int) string {
+	// Адаптивная ширина с ограничениями
+	adaptiveWidth := width
+	if adaptiveWidth < 20 {
+		adaptiveWidth = 20
+	}
+	if adaptiveWidth > 100 {
+		adaptiveWidth = 100
+	}
+	
+	// Адаптивные отступы в зависимости от ширины
+	padding := 1
+	margin := 1
+	if adaptiveWidth < 30 {
+		padding = 0
+		margin = 0
+	}
+	
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(widget.color).
+		Width(adaptiveWidth).
+		Padding(padding).
+		Margin(0, margin, 1, 0)
 	
 	var content strings.Builder
 	
 	// Заголовок с иконкой
 	titleStyle := lipgloss.NewStyle().
 		Foreground(widget.color).
-		Bold(true)
+		Bold(true).
+		MaxWidth(adaptiveWidth - 4) // Учитываем границы и отступы
 	content.WriteString(titleStyle.Render(widget.title))
 	content.WriteString("\n")
 	
+	// Внутренняя ширина для контента
+	contentWidth := adaptiveWidth - 4
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+	
 	switch widget.widgetType {
 	case "gauge":
-		// Рендерим прогресс-бар с анимацией
-		bar := a.renderAnimatedProgressBar(widget.value, widget.maxValue, width-6)
+		// Адаптивный прогресс-бар
+		barWidth := contentWidth - 2
+		if barWidth < 10 {
+			barWidth = 10
+		}
+		bar := a.renderAnimatedProgressBar(widget.value, widget.maxValue, barWidth)
 		content.WriteString(bar)
 		content.WriteString("\n")
-		content.WriteString(fmt.Sprintf("%.1f / %.0f", widget.value, widget.maxValue))
+		
+		// Форматируем значения в зависимости от доступного места
+		if contentWidth > 20 {
+			content.WriteString(fmt.Sprintf("%.1f / %.0f", widget.value, widget.maxValue))
+		} else {
+			content.WriteString(fmt.Sprintf("%.0f%%", (widget.value/widget.maxValue)*100))
+		}
 		
 	case "chart":
-		// Мини-график (будет реализован позже)
-		content.WriteString(widget.content)
+		// Адаптивный мини-график
+		if contentWidth > 15 {
+			content.WriteString(widget.content)
+		} else {
+			// Компактное представление для узких виджетов
+			content.WriteString("📊")
+		}
 		
 	case "info":
-		// Информационный виджет
+		// Информационный виджет с переносом текста
 		infoStyle := lipgloss.NewStyle().
 			Foreground(widget.color).
-			Align(lipgloss.Center)
+			Align(lipgloss.Center).
+			MaxWidth(contentWidth)
 		content.WriteString(infoStyle.Render(widget.content))
 		
 	case "alert":
-		// Предупреждение
+		// Предупреждение с адаптивным размером
 		alertStyle := lipgloss.NewStyle().
 			Foreground(widget.color).
 			Background(lipgloss.Color("52")).
-			Padding(0, 1)
+			Padding(0, min(1, contentWidth/20)). // Адаптивные отступы
+			MaxWidth(contentWidth)
 		content.WriteString(alertStyle.Render(widget.content))
 	}
 	
@@ -4942,8 +5394,9 @@ func (a *App) renderReportPredictions(data *ReportData) string {
 			wearStyle = wearStyle.Foreground(lipgloss.Color("196"))
 		}
 		
-		content.WriteString(wearStyle.Render(fmt.Sprintf("• Через %d мес: %.1f%% износа (%d циклов)\n", 
-			m, futureWear, futureCycles)))
+		content.WriteString(fmt.Sprintf("• %s\n", 
+			wearStyle.Render(fmt.Sprintf("Через %d мес: %.1f%% износа (%d циклов)", 
+				m, futureWear, futureCycles))))
 	}
 	
 	content.WriteString("\n")
@@ -5308,10 +5761,10 @@ func (a *App) initQuickDiag() {
 
 // initDashboard инициализирует dashboard
 func (a *App) initDashboard() {
-	// Создаем кастомные прогресс-бары с шириной
+	// Создаем кастомные прогресс-бары с адаптивной шириной
 	progressWidth := 30
 	if a.windowWidth > 0 {
-		progressWidth = (a.windowWidth / 2) - 20 // Адаптивная ширина
+		progressWidth = (a.windowWidth / 2) - 20
 		if progressWidth < 20 {
 			progressWidth = 20
 		}
@@ -5330,17 +5783,17 @@ func (a *App) initDashboard() {
 		progress.WithWidth(progressWidth),
 	)
 	
-	// Создаем таблицу для последних измерений
+	// Создаем таблицу с фиксированными колонками для компактности
 	columns := []table.Column{
-		{Title: "Время", Width: 8},
-		{Title: "Заряд", Width: 6},
+		{Title: "Время", Width: 5},
+		{Title: "Заряд", Width: 5},
 		{Title: "Состояние", Width: 10},
-		{Title: "Темп.", Width: 6},
+		{Title: "Темп.", Width: 5},
 	}
 	
 	measureTable := table.New(
 		table.WithColumns(columns),
-		table.WithHeight(6),
+		table.WithHeight(4), // Фиксированная высота для 4 записей
 		table.WithFocused(false),
 	)
 	
@@ -5364,18 +5817,30 @@ func (a *App) initReport() {
 		"🔮 Прогнозы",
 	}
 	
-	// Создаем таблицу истории
+	// Создаем таблицу истории с адаптивными колонками
+	tableWidth := a.windowWidth - 10
+	if tableWidth < 50 {
+		tableWidth = 50
+	}
+	columnWidths := a.calculateReportTableColumnWidths(tableWidth)
+	
 	columns := []table.Column{
-		{Title: "Время", Width: 10},
-		{Title: "Заряд %", Width: 8},
-		{Title: "Состояние", Width: 12},
-		{Title: "Темп °C", Width: 8},
-		{Title: "Скорость", Width: 10},
+		{Title: "Время", Width: columnWidths[0]},
+		{Title: "Заряд", Width: columnWidths[1]},
+		{Title: "Состояние", Width: columnWidths[2]},
+		{Title: "Циклы", Width: columnWidths[3]},
+		{Title: "Темп.", Width: columnWidths[4]},
+		{Title: "Износ", Width: columnWidths[5]},
+	}
+	
+	tableHeight := 15
+	if a.windowHeight > 30 {
+		tableHeight = min(20, a.windowHeight-10)
 	}
 	
 	historyTable := table.New(
 		table.WithColumns(columns),
-		table.WithHeight(15),
+		table.WithHeight(tableHeight),
 		table.WithFocused(false),
 	)
 	

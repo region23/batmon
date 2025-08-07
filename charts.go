@@ -67,6 +67,16 @@ func (c *Chart) SetData(data []float64) {
 	}
 }
 
+// SetSize устанавливает новые размеры для графика
+func (c *Chart) SetSize(width, height int) {
+	if width > 0 {
+		c.Width = width
+	}
+	if height > 0 {
+		c.Height = height
+	}
+}
+
 // Render рендерит график в строку
 func (c *Chart) Render() string {
 	if len(c.Data) == 0 {
@@ -264,6 +274,8 @@ func NewBatteryChart(width, height int) *Chart {
 func NewCapacityChart(width, height int) *Chart {
 	chart := NewChart("🔋 Емкость (мАч)", width, height)
 	chart.Color = lipgloss.Color("39") // Синий цвет
+	// Не фиксируем диапазон, чтобы он автоматически подстраивался под данные
+	chart.FixedRange = false
 	return chart
 }
 
@@ -294,6 +306,13 @@ func NewSparkline(width int) *Sparkline {
 func (s *Sparkline) SetData(data []float64) {
 	s.Data = make([]float64, len(data))
 	copy(s.Data, data)
+}
+
+// SetWidth устанавливает новую ширину для спарклайна
+func (s *Sparkline) SetWidth(width int) {
+	if width > 0 {
+		s.Width = width
+	}
 }
 
 // Render рендерит спарклайн
