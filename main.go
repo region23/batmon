@@ -2373,6 +2373,9 @@ func main() {
 	// Проверяем аргументы командной строки для экспорта и справки
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "-version", "--version", "version", "-v":
+			showVersion()
+			return
 		case "-help", "--help", "help":
 			showHelp()
 			return
@@ -2833,6 +2836,30 @@ func showSystemInfo() error {
 	fmt.Scanln()
 
 	return nil
+}
+
+// getVersion возвращает версию приложения из git тега
+func getVersion() string {
+	cmd := exec.Command("git", "describe", "--tags", "--always", "--dirty")
+	output, err := cmd.Output()
+	if err != nil {
+		// Если git недоступен или нет тегов, возвращаем версию по умолчанию
+		return "v2.0-dev"
+	}
+	
+	version := strings.TrimSpace(string(output))
+	if version == "" {
+		return "v2.0-dev"
+	}
+	
+	return version
+}
+
+// showVersion показывает версию приложения
+func showVersion() {
+	version := getVersion()
+	color.New(color.FgCyan, color.Bold).Printf("BatMon %s\n", version)
+	color.New(color.FgWhite).Println("Мониторинг батареи MacBook (Apple Silicon)")
 }
 
 // showHelp показывает справочную информацию
