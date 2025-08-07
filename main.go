@@ -3132,7 +3132,7 @@ func NewApp() *App {
 	}
 	
 	buffer := NewMemoryBuffer(100)
-	if err := buffer.LoadFromDB(db, 50); err != nil {
+	if err := buffer.LoadFromDB(db, 100); err != nil {
 		log.Printf("Предупреждение: не удалось загрузить данные из БД: %v", err)
 	}
 	
@@ -3894,7 +3894,18 @@ func (a *App) renderInfoPanel(width, height int) string {
 	
 	// Вычисляем качество данных для анализа
 	dataPoints := len(a.measurements)
-	dataHours := float64(dataPoints) / 120.0 // примерно 120 измерений в час
+	var dataHours float64
+	if dataPoints > 1 {
+		// Используем реальное время между первым и последним измерением
+		firstTime, _ := time.Parse(time.RFC3339, a.measurements[0].Timestamp)
+		lastTime, _ := time.Parse(time.RFC3339, a.measurements[dataPoints-1].Timestamp)
+		dataHours = lastTime.Sub(firstTime).Hours()
+	} else if dataPoints == 1 {
+		// Если только одно измерение, считаем как 30 секунд (интервал сбора)
+		dataHours = 0.5 / 60.0 // 30 секунд в часах
+	} else {
+		dataHours = 0
+	}
 	dataQuality := "Недостаточно"
 	dataColor := "9" // красный
 	if dataHours >= 2.0 {
