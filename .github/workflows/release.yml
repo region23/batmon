@@ -1,4 +1,4 @@
-name: 🚀 Build and Release macOS App
+name: 🚀 Build and Release
 
 on:
   push:
@@ -23,15 +23,10 @@ on:
 
 permissions:
   contents: write
-  actions: read
-  security-events: write
-  pull-requests: write
-  issues: write
-  repository-projects: write
 
 jobs:
   build-and-release:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     
     steps:
     - name: 📥 Checkout code
@@ -45,102 +40,45 @@ jobs:
     - name: 📦 Install dependencies
       run: go mod tidy
 
-    - name: 🔨 Build for Apple Silicon (arm64)
+    - name: 🔨 Build for multiple platforms
       run: |
-        GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o batmon-arm64
-
-    - name: 🔨 Build for Intel (amd64)  
-      run: |
-        GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o batmon-amd64
-
-    - name: 🔗 Create universal binary
-      run: |
-        lipo -create -output batmon-universal batmon-arm64 batmon-amd64
-        chmod +x batmon-universal
-
-    - name: 📱 Create macOS TUI App Bundle
-      run: |
-        # Create app bundle structure
-        mkdir -p "BatMon.app/Contents/MacOS"
-        mkdir -p "BatMon.app/Contents/Resources"
-        
-        # Copy binary
-        cp batmon-universal "BatMon.app/Contents/MacOS/BatMon"
-        chmod +x "BatMon.app/Contents/MacOS/BatMon"
-        
-        # Copy icon
-        cp logo.png "BatMon.app/Contents/Resources/icon.png"
-        
-        # Create wrapper script that opens Terminal
-        cat > "BatMon.app/Contents/MacOS/BatMon_launcher" << 'EOF'
-        #!/bin/bash
-        # Get the directory where this script is located
-        DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        
-        # Try to use iTerm2 first (better Unicode support), fallback to Terminal
-        if command -v osascript >/dev/null && osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null || test -d "/Applications/iTerm.app"; then
-            # Use iTerm2 
-            osascript -e "tell app \"iTerm2\"
-                tell current window
-                    create tab with default profile
-                    tell current session to write text \"export LANG=en_US.UTF-8; export LC_ALL=en_US.UTF-8; export TERM=xterm-256color; cd '$DIR' && ./BatMon; exit\"
-                end tell
-            end tell" 2>/dev/null || {
-                # Fallback to Terminal if iTerm2 fails
-                osascript -e "tell app \"Terminal\" to do script \"export LANG=en_US.UTF-8; export LC_ALL=en_US.UTF-8; export TERM=xterm-256color; cd '$DIR' && ./BatMon; exit\""
-            }
-        else
-            # Use standard Terminal
-            osascript -e "tell app \"Terminal\" to do script \"export LANG=en_US.UTF-8; export LC_ALL=en_US.UTF-8; export TERM=xterm-256color; cd '$DIR' && ./BatMon; exit\""
-        fi
-        EOF
-        chmod +x "BatMon.app/Contents/MacOS/BatMon_launcher"
-        
-        # Create Info.plist for TUI app
-        cat > "BatMon.app/Contents/Info.plist" << 'EOF'
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>CFBundleExecutable</key>
-            <string>BatMon_launcher</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.batmon.app</string>
-            <key>CFBundleName</key>
-            <string>BatMon</string>
-            <key>CFBundleDisplayName</key>
-            <string>BatMon</string>
-            <key>CFBundleVersion</key>
-            <string>1.0</string>
-            <key>CFBundleShortVersionString</key>
-            <string>1.0</string>
-            <key>CFBundleInfoDictionaryVersion</key>
-            <string>6.0</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleSignature</key>
-            <string>????</string>
-            <key>LSApplicationCategoryType</key>
-            <string>public.app-category.utilities</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>12.0</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-            <key>CFBundleIconFile</key>
-            <string>icon.png</string>
-        </dict>
-        </plist>
-        EOF
-
-    - name: 📦 Package App for Distribution
-      run: |
-        # Create a clean directory for distribution
+        # Создаем директорию для билдов
         mkdir -p dist
-        mv BatMon.app dist/
+        
+        # Linux AMD64
+        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/batmon-linux-amd64
+        
+        # Linux ARM64
+        GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/batmon-linux-arm64
+        
+        # macOS AMD64 (Intel)
+        GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/batmon-darwin-amd64
+        
+        # macOS ARM64 (Apple Silicon)
+        GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/batmon-darwin-arm64
+        
+        # Windows AMD64
+        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/batmon-windows-amd64.exe
+        
+        # Windows ARM64
+        GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o dist/batmon-windows-arm64.exe
+
+    - name: 📦 Create archives
+      run: |
         cd dist
-        zip -r BatMon.zip BatMon.app
-        # Create checksum
-        shasum -a 256 BatMon.zip > BatMon.zip.sha256
+        
+        # Создаем tar.gz для Unix-подобных систем
+        tar -czf batmon-linux-amd64.tar.gz batmon-linux-amd64
+        tar -czf batmon-linux-arm64.tar.gz batmon-linux-arm64
+        tar -czf batmon-darwin-amd64.tar.gz batmon-darwin-amd64
+        tar -czf batmon-darwin-arm64.tar.gz batmon-darwin-arm64
+        
+        # Создаем zip для Windows
+        zip batmon-windows-amd64.zip batmon-windows-amd64.exe
+        zip batmon-windows-arm64.zip batmon-windows-arm64.exe
+        
+        # Создаем checksums
+        sha256sum *.tar.gz *.zip > checksums.txt
 
     - name: 📊 Get version info
       id: version
@@ -165,54 +103,73 @@ jobs:
         git push origin ${{ steps.version.outputs.version }}
 
     - name: 🚀 Create Release
-      # Всегда создаем релиз, поскольку workflow запускается только на тегах или manual dispatch
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.version.outputs.version }}
         files: |
-          dist/BatMon.zip
-          dist/BatMon.zip.sha256
+          dist/*.tar.gz
+          dist/*.zip
+          dist/checksums.txt
         draft: ${{ github.event.inputs.draft == 'true' }}
         prerelease: ${{ github.event.inputs.prerelease == 'true' }}
         body: |
           ## 🔋 BatMon ${{ steps.version.outputs.version }}
           
-          ### 📥 Установка для обычных пользователей
+          Интеллектуальный мониторинг батареи MacBook с детальной аналитикой.
           
-          1. **Скачайте**: `BatMon.zip` из списка файлов ниже
-          2. **Распакуйте**: Двойной клик по скачанному zip-файлу  
-          3. **Запустите**: Двойной клик по `BatMon.app`
-          4. **Готово!** Программа откроется с приветственным экраном
+          ### 📥 Быстрая установка
           
-          ### ✨ Что нового
-          - Полный анализ батареи MacBook (100% → 0%)
-          - Предотвращение засыпания во время тестирования  
-          - Быстрая диагностика состояния батареи
-          - Детальные отчеты с рекомендациями по замене
-          - Интерактивный интерфейс с цветными индикаторами
+          **Для пользователей Go:**
+          ```bash
+          go install github.com/region23/batmon@${{ steps.version.outputs.version }}
+          ```
+          
+          **Для остальных - скачайте готовый бинарник:**
+          
+          #### 🍎 macOS
+          - **Apple Silicon (M1/M2/M3)**: `batmon-darwin-arm64.tar.gz`
+          - **Intel**: `batmon-darwin-amd64.tar.gz`
+          
+          #### 🐧 Linux
+          - **AMD64/x86_64**: `batmon-linux-amd64.tar.gz`
+          - **ARM64**: `batmon-linux-arm64.tar.gz`
+          
+          #### 🪟 Windows
+          - **AMD64/x86_64**: `batmon-windows-amd64.zip`
+          - **ARM64**: `batmon-windows-arm64.zip`
+          
+          ### 🚀 Как использовать
+          
+          1. Скачайте архив для вашей платформы
+          2. Распакуйте: `tar -xzf batmon-*.tar.gz` или разархивируйте zip
+          3. Запустите: `./batmon` (или `batmon.exe` на Windows)
+          4. Выберите "Полный анализ батареи (100% → 0%)" для основного сценария
+          
+          ### ✨ Основные возможности
+          - 🔋 Полный анализ батареи от 100% до 0%
+          - 📊 Интерактивные графики и детальная статистика
+          - 📄 Экспорт отчетов в HTML/Markdown
+          - 🌡️ Мониторинг температуры батареи
+          - 💡 Персонализированные рекомендации по замене
+          - 🎯 Кроссплатформенность (macOS, Linux, Windows)
           
           ### 🛡️ Безопасность
-          - Файл подписан контрольной суммой SHA256
-          - Проверить: `shasum -a 256 BatMon.zip` (должно совпасть с .sha256 файлом)
+          - ✅ Проверьте контрольные суммы: `sha256sum -c checksums.txt`
+          - ✅ Код полностью открытый на [GitHub](https://github.com/region23/batmon)
           
-          ### 💻 Совместимость
-          - ✅ MacBook с Apple Silicon (M1, M2, M3)
-          - ✅ MacBook с Intel процессорами
-          - ✅ macOS 12.0+ (Monterey и новее)
-          
-          ### 🆘 Поддержка
-          Если macOS показывает предупреждение о безопасности:
-          1. Откройте **Системные настройки** → **Конфиденциальность и безопасность**
-          2. Найдите сообщение о BatMon и нажмите **Все равно открыть**
-          3. Или запустите в Терминале: `xattr -d com.apple.quarantine /path/to/BatMon.app`
+          ### 📊 Совместимость
+          - ✅ **macOS**: 12.0+ (Monterey и новее)
+          - ✅ **Linux**: Любой дистрибутив с systemd (Ubuntu, CentOS, etc)
+          - ✅ **Windows**: 10+ (экспериментально)
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 📤 Upload Artifact
+    - name: 📤 Upload Build Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: BatMon-${{ steps.version.outputs.version }}
+        name: batmon-${{ steps.version.outputs.version }}
         path: |
-          dist/BatMon.zip
-          dist/BatMon.zip.sha256
+          dist/*.tar.gz
+          dist/*.zip
+          dist/checksums.txt
         retention-days: 30

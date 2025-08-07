@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,33 +41,72 @@ const (
 	profilerInterval = 2 * time.Minute  // интервал опроса system_profiler
 )
 
-// getAppSupportDir возвращает путь к папке Application Support для BatMon
-func getAppSupportDir() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("не удалось получить домашнюю папку: %w", err)
-	}
+// getDataDir возвращает кроссплатформенную папку для данных приложения по стандарту XDG
+func getDataDir() (string, error) {
+	var dataDir string
 	
-	appSupportDir := filepath.Join(homeDir, "Library", "Application Support", "BatMon")
+	// Определяем папку в зависимости от ОС следуя XDG Base Directory Specification
+	switch runtime.GOOS {
+	case "windows":
+		// Windows: %LOCALAPPDATA%\batmon (или %APPDATA%\batmon)
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			dataDir = filepath.Join(localAppData, "batmon")
+		} else if appData := os.Getenv("APPDATA"); appData != "" {
+			dataDir = filepath.Join(appData, "batmon")
+		} else {
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return "", fmt.Errorf("не удалось получить домашнюю папку: %w", err)
+			}
+			dataDir = filepath.Join(homeDir, "AppData", "Local", "batmon")
+		}
+		
+	case "darwin":
+		// macOS: ~/.local/share/batmon (XDG-совместимо, как на Linux)
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("не удалось получить домашнюю папку: %w", err)
+		}
+		// Используем XDG_DATA_HOME или ~/.local/share
+		if xdgDataHome := os.Getenv("XDG_DATA_HOME"); xdgDataHome != "" {
+			dataDir = filepath.Join(xdgDataHome, "batmon")
+		} else {
+			dataDir = filepath.Join(homeDir, ".local", "share", "batmon")
+		}
+		
+	default:
+		// Linux и другие Unix: ~/.local/share/batmon (XDG Base Directory)
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("не удалось получить домашнюю папку: %w", err)
+		}
+		
+		// Используем XDG_DATA_HOME если установлена, иначе ~/.local/share
+		if xdgDataHome := os.Getenv("XDG_DATA_HOME"); xdgDataHome != "" {
+			dataDir = filepath.Join(xdgDataHome, "batmon")
+		} else {
+			dataDir = filepath.Join(homeDir, ".local", "share", "batmon")
+		}
+	}
 	
 	// Создаем папку если её нет
-	if err := os.MkdirAll(appSupportDir, 0755); err != nil {
-		return "", fmt.Errorf("не удалось создать папку Application Support: %w", err)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return "", fmt.Errorf("не удалось создать папку для данных: %w", err)
 	}
 	
-	return appSupportDir, nil
+	return dataDir, nil
 }
 
-// getDBPath возвращает путь к файлу базы данных в Application Support
+// getDBPath возвращает путь к файлу базы данных
 func getDBPath() string {
-	appSupportDir, err := getAppSupportDir()
+	dataDir, err := getDataDir()
 	if err != nil {
-		// Fallback на текущую директорию если не можем создать Application Support
-		log.Printf("Не удалось создать Application Support, используем текущую папку: %v", err)
+		// Fallback на текущую директорию если не можем создать папку данных
+		log.Printf("Не удалось создать папку данных, используем текущую папку: %v", err)
 		return "batmon.sqlite"
 	}
 	
-	return filepath.Join(appSupportDir, "batmon.sqlite")
+	return filepath.Join(dataDir, "batmon.sqlite")
 }
 
 // getDocumentsDir возвращает путь к папке Documents пользователя
