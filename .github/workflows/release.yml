@@ -2,10 +2,7 @@ name: 🚀 Build and Release macOS App
 
 on:
   push:
-    branches: [ main ]
     tags: [ 'v*' ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       version:
@@ -150,16 +147,13 @@ jobs:
       run: |
         if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
           echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          echo "is_tag=true" >> $GITHUB_OUTPUT
           echo "is_manual=true" >> $GITHUB_OUTPUT
         elif [[ $GITHUB_REF == refs/tags/* ]]; then
           echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          echo "is_tag=true" >> $GITHUB_OUTPUT
           echo "is_manual=false" >> $GITHUB_OUTPUT
         else
-          echo "version=dev-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
-          echo "is_tag=false" >> $GITHUB_OUTPUT
-          echo "is_manual=false" >> $GITHUB_OUTPUT
+          echo "ERROR: Workflow triggered unexpectedly" >&2
+          exit 1
         fi
 
     - name: 🏷️ Create tag for manual release
@@ -170,8 +164,8 @@ jobs:
         git tag -a ${{ steps.version.outputs.version }} -m "Release ${{ steps.version.outputs.version }}"
         git push origin ${{ steps.version.outputs.version }}
 
-    - name: 🚀 Create Release (for tags only)
-      if: steps.version.outputs.is_tag == 'true'
+    - name: 🚀 Create Release
+      # Всегда создаем релиз, поскольку workflow запускается только на тегах или manual dispatch
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.version.outputs.version }}
@@ -214,7 +208,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 📤 Upload Artifact (for all builds)
+    - name: 📤 Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: BatMon-${{ steps.version.outputs.version }}
