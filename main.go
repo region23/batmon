@@ -36,10 +36,71 @@ import (
 )
 
 const (
-	dbFile           = "batmon.sqlite"  // имя файла SQLite
 	pmsetInterval    = 30 * time.Second // интервал опроса pmset
 	profilerInterval = 2 * time.Minute  // интервал опроса system_profiler
 )
+
+// getAppSupportDir возвращает путь к папке Application Support для BatMon
+func getAppSupportDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("не удалось получить домашнюю папку: %w", err)
+	}
+	
+	appSupportDir := filepath.Join(homeDir, "Library", "Application Support", "BatMon")
+	
+	// Создаем папку если её нет
+	if err := os.MkdirAll(appSupportDir, 0755); err != nil {
+		return "", fmt.Errorf("не удалось создать папку Application Support: %w", err)
+	}
+	
+	return appSupportDir, nil
+}
+
+// getDBPath возвращает путь к файлу базы данных в Application Support
+func getDBPath() string {
+	appSupportDir, err := getAppSupportDir()
+	if err != nil {
+		// Fallback на текущую директорию если не можем создать Application Support
+		log.Printf("Не удалось создать Application Support, используем текущую папку: %v", err)
+		return "batmon.sqlite"
+	}
+	
+	return filepath.Join(appSupportDir, "batmon.sqlite")
+}
+
+// getDocumentsDir возвращает путь к папке Documents пользователя
+func getDocumentsDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("не удалось получить домашнюю папку: %w", err)
+	}
+	
+	documentsDir := filepath.Join(homeDir, "Documents")
+	return documentsDir, nil
+}
+
+// getExportPath возвращает полный путь для экспортируемого файла
+func getExportPath(filename string) (string, error) {
+	// Если путь уже абсолютный, используем как есть
+	if filepath.IsAbs(filename) {
+		return filename, nil
+	}
+	
+	// Если содержит разделители пути, используем как есть (относительный путь)
+	if strings.Contains(filename, string(filepath.Separator)) {
+		return filename, nil
+	}
+	
+	// Иначе сохраняем в Documents
+	documentsDir, err := getDocumentsDir()
+	if err != nil {
+		// Fallback на текущую директорию
+		return filename, nil
+	}
+	
+	return filepath.Join(documentsDir, filename), nil
+}
 
 // TrendAnalysis содержит результат анализа тренда
 type TrendAnalysis struct {
@@ -252,7 +313,7 @@ func (dr *DataRetention) GetStats() (map[string]interface{}, error) {
 	}
 
 	// Размер БД файла
-	if dbFileInfo, err := os.Stat(dbFile); err == nil {
+	if dbFileInfo, err := os.Stat(getDBPath()); err == nil {
 		stats["db_size_mb"] = float64(dbFileInfo.Size()) / (1024 * 1024)
 	}
 
@@ -2411,7 +2472,7 @@ func runMonitoringMode() error {
 	fmt.Println()
 
 	// Инициализируем БД
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return fmt.Errorf("инициализация БД: %w", err)
 	}
@@ -2466,7 +2527,7 @@ func runMonitoringMode() error {
 func runReportMode() error {
 	color.New(color.FgBlue).Println("📊 Загрузка детального отчета...")
 
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return fmt.Errorf("инициализация БД: %w", err)
 	}
@@ -2580,10 +2641,11 @@ func runSettingsMenu() error {
 	
 	if choice == "y" || choice == "Y" || choice == "н" || choice == "Н" {
 		// Удаляем файлы базы данных
+		dbPath := getDBPath()
 		dbFiles := []string{
-			dbFile,                // batmon.sqlite
-			dbFile + "-shm",       // batmon.sqlite-shm
-			dbFile + "-wal",       // batmon.sqlite-wal
+			dbPath,                // .batmon.sqlite
+			dbPath + "-shm",       // .batmon.sqlite-shm
+			dbPath + "-wal",       // .batmon.sqlite-wal
 		}
 		
 		for _, file := range dbFiles {
@@ -2607,7 +2669,7 @@ func runSettingsMenu() error {
 
 // showDatabaseStats показывает статистику базы данных
 func showDatabaseStats() error {
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return err
 	}
@@ -2638,7 +2700,7 @@ func showDatabaseStats() error {
 func showAdvancedMetrics() error {
 	color.New(color.FgBlue).Println("🔬 Загрузка расширенных метрик...")
 
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return err
 	}
@@ -2680,7 +2742,7 @@ func showAdvancedMetrics() error {
 func cleanupOldData() error {
 	color.New(color.FgYellow).Println("🧹 Очистка старых данных...")
 
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return err
 	}
@@ -2708,7 +2770,7 @@ func showSystemInfo() error {
 	// Информация о версии Go
 	fmt.Printf("🔧 Версия Go: %s\n", "1.24+")
 	fmt.Printf("💾 База данных: SQLite с WAL режимом\n")
-	fmt.Printf("📁 Файл БД: %s\n", dbFile)
+	fmt.Printf("📁 Файл БД: %s\n", getDBPath())
 
 	// Проверяем доступность команд
 	if _, err := exec.LookPath("pmset"); err == nil {
@@ -2790,7 +2852,7 @@ func runExportMode(markdownFile, htmlFile string, quiet bool) error {
 		fmt.Println("🔋 Batmon - Экспорт отчетов")
 	}
 
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return fmt.Errorf("инициализация БД: %w", err)
 	}
@@ -2809,15 +2871,21 @@ func runExportMode(markdownFile, htmlFile string, quiet bool) error {
 		if !strings.HasSuffix(markdownFile, ".md") {
 			markdownFile += ".md"
 		}
+		
+		// Получаем правильный путь для экспорта
+		fullMarkdownPath, err := getExportPath(markdownFile)
+		if err != nil {
+			return fmt.Errorf("не удалось определить путь для Markdown файла: %w", err)
+		}
 
 		if !quiet {
-			fmt.Printf("📝 Экспортирую отчет в Markdown: %s\n", markdownFile)
+			fmt.Printf("📝 Экспортирую отчет в Markdown: %s\n", fullMarkdownPath)
 		}
 
-		if err := exportToMarkdown(data, markdownFile); err != nil {
+		if err := exportToMarkdown(data, fullMarkdownPath); err != nil {
 			return fmt.Errorf("экспорт в Markdown: %w", err)
 		}
-		exported = append(exported, markdownFile)
+		exported = append(exported, fullMarkdownPath)
 	}
 
 	// Экспорт в HTML
@@ -2825,15 +2893,21 @@ func runExportMode(markdownFile, htmlFile string, quiet bool) error {
 		if !strings.HasSuffix(htmlFile, ".html") && !strings.HasSuffix(htmlFile, ".htm") {
 			htmlFile += ".html"
 		}
+		
+		// Получаем правильный путь для экспорта
+		fullHTMLPath, err := getExportPath(htmlFile)
+		if err != nil {
+			return fmt.Errorf("не удалось определить путь для HTML файла: %w", err)
+		}
 
 		if !quiet {
-			fmt.Printf("🌐 Экспортирую отчет в HTML: %s\n", htmlFile)
+			fmt.Printf("🌐 Экспортирую отчет в HTML: %s\n", fullHTMLPath)
 		}
 
-		if err := exportToHTML(data, htmlFile); err != nil {
+		if err := exportToHTML(data, fullHTMLPath); err != nil {
 			return fmt.Errorf("экспорт в HTML: %w", err)
 		}
-		exported = append(exported, htmlFile)
+		exported = append(exported, fullHTMLPath)
 	}
 
 	if !quiet && len(exported) > 0 {
@@ -2982,7 +3056,7 @@ func updateData(ds *DataService) tea.Cmd {
 // NewApp создает новое приложение
 func NewApp() *App {
 	// Инициализация базы данных и буфера
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -3210,8 +3284,13 @@ func (a *App) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.exportStatus = "" // Очищаем статус при выходе
 		return a, nil
 	case "enter":
-		// Генерируем имя файла с текущей датой
-		filename := fmt.Sprintf("report_%s.html", time.Now().Format("2006-01-02"))
+		// Генерируем имя файла с текущей датой в Documents
+		documentsDir, err := getDocumentsDir()
+		if err != nil {
+			// Fallback на текущую директорию
+			documentsDir = "."
+		}
+		filename := filepath.Join(documentsDir, fmt.Sprintf("batmon_report_%s.html", time.Now().Format("2006-01-02")))
 		a.exportStatus = "Экспорт в процессе..."
 		a.exportToHTMLAsync(filename)
 		return a, nil
@@ -3223,7 +3302,7 @@ func (a *App) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (a *App) exportToHTMLAsync(filename string) {
 	go func() {
 		// Создаем временное соединение с базой данных для экспорта
-		db, err := initDB(dbFile)
+		db, err := initDB(getDBPath())
 		if err != nil {
 			a.exportStatus = "Ошибка подключения к БД"
 			return
@@ -3251,7 +3330,7 @@ func (a *App) exportToHTMLAsync(filename string) {
 // generateUIReportData генерирует данные для UI отчета
 func (a *App) generateUIReportData() (*ReportData, error) {
 	// Создаем соединение с базой данных как в экспорте
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return nil, fmt.Errorf("ошибка подключения к БД: %w", err)
 	}
@@ -4888,7 +4967,7 @@ func (a *App) renderExport() string {
 	content := "📄 Экспорт отчетов\n\n"
 	content += "Экспорт в HTML с автогенерацией имени файла\n\n"
 	content += "Нажмите Enter для экспорта в HTML\n"
-	content += "Файл будет сохранен как report_YYYY-MM-DD.html\n\n"
+	content += "Файл будет сохранен в ~/Documents/ как batmon_report_YYYY-MM-DD.html\n\n"
 	
 	// Показываем статус экспорта если есть
 	if a.exportStatus != "" {
@@ -5291,10 +5370,11 @@ func (a *App) clearDatabase() error {
 	}
 	
 	// Удаляем файл базы данных и все связанные файлы
+	dbPath := getDBPath()
 	dbFiles := []string{
-		dbFile,                // batmon.sqlite
-		dbFile + "-shm",       // batmon.sqlite-shm
-		dbFile + "-wal",       // batmon.sqlite-wal
+		dbPath,                // .batmon.sqlite
+		dbPath + "-shm",       // .batmon.sqlite-shm
+		dbPath + "-wal",       // .batmon.sqlite-wal
 	}
 	
 	for _, file := range dbFiles {
@@ -5314,7 +5394,7 @@ func (a *App) clearDatabase() error {
 	a.latest = nil
 	
 	// Переинициализируем базу данных и сервис
-	db, err := initDB(dbFile)
+	db, err := initDB(getDBPath())
 	if err != nil {
 		return fmt.Errorf("не удалось переинициализировать БД: %v", err)
 	}
