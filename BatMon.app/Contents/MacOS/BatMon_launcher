@@ -1,0 +1,20 @@
+#!/bin/bash
+# Get the directory where this script is located
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Try to use iTerm2 first (better Unicode support), fallback to Terminal
+if command -v osascript >/dev/null && osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null || test -d "/Applications/iTerm.app"; then
+    # Use iTerm2 
+    osascript -e "tell app \"iTerm2\"
+        tell current window
+            create tab with default profile
+            tell current session to write text \"export LANG=en_US.UTF-8; export LC_ALL=en_US.UTF-8; export TERM=xterm-256color; cd '$DIR' && ./BatMon; exit\"
+        end tell
+    end tell" 2>/dev/null || {
+        # Fallback to Terminal if iTerm2 fails
+        osascript -e "tell app \"Terminal\" to do script \"export LANG=en_US.UTF-8; export LC_ALL=en_US.UTF-8; export TERM=xterm-256color; cd '$DIR' && ./BatMon; exit\""
+    }
+else
+    # Use standard Terminal
+    osascript -e "tell app \"Terminal\" to do script \"export LANG=en_US.UTF-8; export LC_ALL=en_US.UTF-8; export TERM=xterm-256color; cd '$DIR' && ./BatMon; exit\""
+fi
